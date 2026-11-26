@@ -1,0 +1,11 @@
+{
+  "name": "mono-investment-workspace",
+  "version": "3.3.1",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node server.mjs"
+  }
+}

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 108 108">
+  <rect id="tile" x="0" y="0" width="108" height="108" rx="30" fill="#FFFFFF"/>
+  <polygon id="mark" points="24.5,72 24.5,33 35.2,33 47,57 58.8,33 69.5,33 69.5,72 60.5,72 60.5,49 47,72 33.5,49 33.5,72" fill="#14151A"/>
+  <rect id="period" x="76.5" y="62.5" width="10.5" height="10.5" fill="#2346E8"/>
+</svg>
