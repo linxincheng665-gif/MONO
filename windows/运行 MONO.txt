@@ -1,0 +1,8 @@
+MONO · Windows 桌面版
+
+解压整个 ZIP 后，打开 MONO 文件夹，双击 MONO.exe。
+适用于 Windows 10 或 Windows 11 的 64 位系统，需要 Microsoft Edge WebView2 Runtime。
+如果系统尚未安装 WebView2，请使用应用启动提示打开 Microsoft 官方下载页面。
+
+工作区数据保存在本机的 %LOCALAPPDATA%\MONO\WebView2。
+下一版可以解压到新的目录，继续使用同一个本机工作区。
