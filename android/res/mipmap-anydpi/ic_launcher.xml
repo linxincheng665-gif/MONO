@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="48dp"
+    android:height="48dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="@color/mono_porcelain"
+        android:pathData="M30,0 H78 A30,30 0 0,1 108,30 V78 A30,30 0 0,1 78,108 H30 A30,30 0 0,1 0,78 V30 A30,30 0 0,1 30,0 Z" />
+    <path android:fillColor="@color/mono_icon_ink" android:pathData="@string/mono_icon_mark" />
+    <path android:fillColor="@color/mono_accent" android:pathData="@string/mono_icon_period" />
+</vector>

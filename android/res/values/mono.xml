@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">MONO</string>
+    <string name="choose_history">选择 CSV 或 TSV 行情文件</string>
+    <string name="chooser_unavailable">此设备没有可用的文件选择器。</string>
+    <color name="mono_porcelain">#FFFFFF</color>
+    <color name="mono_accent">#2346E8</color>
+    <color name="mono_icon_ink">#14151A</color>
+    <string name="mono_icon_mark" translatable="false">M24.5,72 L24.5,33 L35.2,33 L47,57 L58.8,33 L69.5,33 L69.5,72 L60.5,72 L60.5,49 L47,72 L33.5,49 L33.5,72 Z</string>
+    <string name="mono_icon_period" translatable="false">M76.5,62.5 H87 V73 H76.5 Z</string>
+    <style name="MonoTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/mono_porcelain</item>
+        <item name="android:statusBarColor">@color/mono_porcelain</item>
+        <item name="android:navigationBarColor">@color/mono_porcelain</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:colorAccent">@color/mono_accent</item>
+    </style>
+</resources>

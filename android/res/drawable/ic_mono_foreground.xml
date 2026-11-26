@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <group
+        android:pivotX="54"
+        android:pivotY="54"
+        android:scaleX="0.6666667"
+        android:scaleY="0.6666667">
+        <path android:fillColor="@color/mono_icon_ink" android:pathData="@string/mono_icon_mark" />
+        <path android:fillColor="@color/mono_accent" android:pathData="@string/mono_icon_period" />
+    </group>
+</vector>
