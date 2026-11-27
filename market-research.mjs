@@ -135,6 +135,8 @@ export function applyOpportunityPlan(item, plan) {
 
 export function opportunityFor(instrument, strategy) {
   const { decision, data, technical, conditions, plan, horizon } = strategy;
+  const period = strategy.horizons?.find((item) => item.key === horizon);
+  const trend = period?.trend?.direction ?? technical.trend;
   const base = { ...instrument, type: strategy.instrumentType ?? instrument.type, action: decision.action, reason: decision.reason, status: decision.status,
     quoteDate: data.quoteDate, source: data.historySource, historyDate: data.lastDate };
   if (data.historyStatus !== 'ready') return { ...base, category: '补齐行情' };
@@ -144,16 +146,16 @@ export function opportunityFor(instrument, strategy) {
   const zone = plan?.source === 'observed' ? plan.entryZone : null;
   const categories = [
     ...(qualified ? ['条件已满足'] : []),
-    ...(zone && technical.trend === 'up' && technical.return20 > 0 ? ['上升趋势回调'] : []),
-    ...(zone && horizon === 'short' && technical.trend !== 'up' && technical.close > technical.ma20 ? ['短线修复'] : []),
+    ...(zone && trend === 'up' && technical.return20 > 0 ? ['上升趋势回调'] : []),
+    ...(zone && horizon === 'short' && trend !== 'up' && technical.close > technical.ma20 ? ['短线修复'] : []),
     ...(growth?.status === 'pass' && growth.verified ? ['增长待复核'] : []),
     ...(valuation?.status === 'pass' && valuation.verified ? ['估值待复核'] : []),
   ];
   const observed = plan?.source === 'observed' ? plan : null;
   return { ...base, category: categories[0] ?? '等待条件', categories, entry: observed?.entry ?? null,
     stop: observed?.stop ?? null, target: observed?.target ?? null, zone, ratio: observed?.ratio ?? null,
-    historyReady: true, trend: technical.trend, return20: technical.return20, volatility: technical.volatility,
-    volumeRatio: technical.volumeRatio, risk: strategy.uncertainty?.[0], trigger: strategy.horizons?.find((item) => item.key === horizon)?.trigger };
+    historyReady: true, trend, return20: technical.return20, volatility: technical.volatility,
+    volumeRatio: technical.volumeRatio, risk: strategy.uncertainty?.[0], trigger: period?.trigger };
 }
 
 export function pulseInstruments(market) {

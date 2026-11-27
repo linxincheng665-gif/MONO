@@ -166,7 +166,13 @@ function scopedPortfolio(currencyCode) {
 }
 function initialTrade(forSymbol = state.watchlist[0]?.symbol ?? state.holdings[0]?.symbol ?? '') {
   const currencyCode = instrumentCurrency(forSymbol);
-  return { symbol: forSymbol, entry: '', target: '', stop: '', amount: state[cashField(currencyCode)] || '', riskPercent: 1, fractional: currencyCode === 'USD' };
+  return { symbol: forSymbol, entry: '', target: '', stop: '', amount: '', riskPercent: 1, fractional: currencyCode === 'USD' };
+}
+function tradePortfolioContext(ticker, portfolio, summary = portfolioSummary(portfolio)) {
+  const positionValue = summary.rows.reduce((total, row) =>
+    total + (row.symbol === ticker ? row.value ?? 0 : 0), 0);
+  return { cash: summary.cash, equity: summary.total, positionValue, incomplete: summary.incomplete, demo: portfolio.demo,
+    capPercent: state.riskProfile?.cap ?? 25, reservePercent: state.riskProfile?.maxCashTarget ?? 20 };
 }
 function tickers() {
   return [...new Set([...state.watchlist, ...state.holdings, ...Object.values(state.strategyJournal).filter((item) => !item.paused),
@@ -416,7 +422,7 @@ function refreshTrend() {
 
 function buildContext() {
   const portfolio = scopedPortfolio(portfolioCurrency);
-  const tradeSummary = portfolioSummary(scopedPortfolio(instrumentCurrency(tradeInputs.symbol)));
+  const tradePortfolio = tradePortfolioContext(tradeInputs.symbol, scopedPortfolio(instrumentCurrency(tradeInputs.symbol)));
   const summary = portfolioSummary(portfolio);
   const history = dailyHistory(symbol).bars;
   const researchInputs = state.research[symbol] ?? {};
@@ -457,7 +463,7 @@ function buildContext() {
   return { state: ['holdings', 'risk'].includes(page) ? portfolio : state, portfolio: portfolioWithHistory, portfolioCurrency, displayedCurrency, privateAmounts,
     summary, symbol, quote, orderBook, marketFilter, exchangeLabel, marketStatus: signal.status, marketLabel: signal.label, alpacaFeed: alpacaConfig?.feed,
     history, indicators: indicators(history), tradeInputs, researchInputs,
-    trade: tradePlan({ ...tradeInputs, cash: tradeSummary.cash, equity: tradeSummary.total }), tradeCash: tradeSummary.cash,
+    trade: tradePlan({ ...tradeInputs, ...tradePortfolio }), tradeCash: tradePortfolio.cash, tradeDemo: tradePortfolio.demo,
     shock, stress, strategy, diagnostics, alternative, riskLab, riskTab, riskScenario: scenario, riskSimulation: simulation,
     watchQuotes, journal: state.strategyJournal[journalKey], alerts: state.researchAlerts.filter((alert) => alert.symbol === symbol),
     evidence, evidenceState: researchRequests.get(symbol)?.loading ?? false,
@@ -490,26 +496,26 @@ function evidenceFor(ticker) {
 
 function analyzeInstrument(ticker, horizon, selectedType, screening = false) {
   const daily = dailyHistory(ticker);
-  const inputs = { ...(screening ? {} : state.research[ticker]), ...(horizon ? { horizon } : {}) };
+  const saved = state.research[ticker] ?? {};
+  const { entry, stop, target, ...screeningInputs } = saved;
+  const inputs = { ...(screening ? screeningInputs : saved), ...(horizon ? { horizon } : {}) };
   const currency = instrumentCurrency(ticker);
   const scoped = scopedPortfolio(currency);
-  const summary = portfolioSummary(scoped);
   const name = [...state.holdings, ...state.watchlist].find((item) => item.symbol === ticker)?.name ?? '';
   const evidence = evidenceFor(ticker);
   const basis = evidence.fundamentals ?? [];
   const publicValuation = state.publicQuotes[ticker]?.valuation;
-  const kind = selectedType || inputs.assetType || publicValuation?.kind || candidateFor(ticker)?.type || (/\bETF\b/i.test(name) || /^(?:51|56|58)\d{4}\.SH$|^159\d{3}\.SZ$/.test(ticker) ||
+  const kind = inputs.assetType || selectedType || publicValuation?.kind || candidateFor(ticker)?.type || (/\bETF\b/i.test(name) || /^(?:51|56|58)\d{4}\.SH$|^159\d{3}\.SZ$/.test(ticker) ||
     basis.some((entry) => ['expenseRatioPct', 'trackingErrorPct'].includes(entry.metric)) ? 'etf'
     : /^(?:60|68)\d{4}\.SH$|^(?:00|30)\d{4}\.SZ$|^\d{6}\.BJ$/.test(ticker) || basis.some((entry) => entry.metric === 'revenueGrowthPct') ||
       /\b(?:Inc|Corp|Ltd)\b/i.test(name) ? 'equity' : null);
-  const weight = summary.rows.filter((row) => row.symbol === ticker && Number.isFinite(row.weight)).reduce((sum, row) => sum + row.weight, 0);
   return runInvestmentResearch({
     symbol: ticker, bars: daily.bars, historySource: daily.source, quote: quoteFor(state, ticker), inputs,
     metadata: { market: instrumentMarket(ticker), currency, type: kind, benchmark: benchmarkFor(ticker) },
     benchmarkBars: ticker === benchmarkFor(ticker) ? [] : dailyHistory(benchmarkFor(ticker)).bars,
     evidence, includeBacktest: false, publicValuation,
-    portfolio: { cash: summary.cash, equity: summary.total, weight, incomplete: summary.incomplete || scoped.demo,
-      amount: inputs.amount, capPercent: state.riskProfile?.cap, reservePercent: state.riskProfile?.maxCashTarget, riskPercent: inputs.riskPercent || 1 },
+    portfolio: { ...tradePortfolioContext(ticker, scoped), amount: inputs.amount, riskPercent: inputs.riskPercent ?? 1,
+      fractional: currency === 'USD' },
   });
 }
 
@@ -775,7 +781,7 @@ function renderShell() {
     <aside class="sidebar" id="mobile-drawer" aria-label="工作空间菜单">
       <div class="drawer-head"><a class="brand" href="#overview" aria-label="MONO 首页"><span>MONO</span><i aria-hidden="true"></i><img class="workspace-monogram" src="mono-icon.svg" alt="" width="32" height="32"></a><button class="icon-button" data-action="close-menu" aria-label="关闭导航">${icons('close', 19)}</button></div>
       <nav aria-label="主导航">${nav}</nav>
-      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.1</span></div>
+      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.2</span></div>
     </aside>
     <header class="topbar"><div class="topbar-content">
       <div class="topbar-brand">
@@ -1230,9 +1236,9 @@ function saveTrade() {
 function useStrategy() {
   const { strategy } = buildContext();
   if (!strategy?.symbol || !strategy.canTransfer) { announce('暂无可带入的完整计划，请核对行情及价位。'); return; }
+  const inputs = state.research[strategy.symbol] ?? {};
   tradeInputs = { ...initialTrade(strategy.symbol), entry: strategy.entry, target: strategy.target, stop: strategy.stop,
-    amount: Number.isFinite(strategy.plan?.size?.investment) ? strategy.plan.size.investment : initialTrade(strategy.symbol).amount,
-    riskPercent: state.research[strategy.symbol]?.riskPercent || 1 };
+    amount: inputs.amount ?? '', riskPercent: inputs.riskPercent ?? 1 };
   navigate('trades');
 }
 
@@ -1348,8 +1354,8 @@ function addResearchAlert() {
       item.date = new Date(values.date).toISOString();
     }
     if (item.type === 'invalidate') {
-      const stop = analyzeInstrument(ticker, horizon).stop;
-      if (!Number.isFinite(stop)) throw new Error('先建立带失效价的策略。');
+      const stop = analyzeInstrument(ticker, horizon).horizons.find(({ key: period }) => period === horizon)?.stop;
+      if (!Number.isFinite(stop)) throw new Error('当前周期暂无行情失效价。手填价位可使用价格提醒。');
       item.price = stop;
     }
     if (item.type === 'opportunity') {
@@ -1632,6 +1638,10 @@ root.addEventListener('click', (event) => {
     'opportunity-more': () => { opportunityVisibleRows += 14; updateResults(); },
     'open-research-symbol': () => {
       selectInstrument(ticker);
+      if (page === 'opportunities') {
+        state.research[ticker] = { ...state.research[ticker], horizon: opportunityPlan.horizon };
+        persist();
+      }
       discoveredSymbol = ticker;
       publicFeed.setSymbols(publicTickers());
       if (page === 'research') {
@@ -1843,10 +1853,16 @@ window.addEventListener('resize', () => {
     hideChartPoint(tooltip.parentElement.querySelector('.chart-hit'));
   }
 });
-document.addEventListener('visibilitychange', () => { if (!document.hidden) { ensurePageHistory(); queueStrategyReview(); } });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) return;
+  ensurePageHistory();
+  if (page === 'research' && !dialog.open) updateResults();
+  queueStrategyReview();
+});
 setInterval(() => {
   if (document.hidden) return;
   ensurePageHistory();
+  if (page === 'research' && !dialog.open) updateResults();
   if (page !== 'research' && Object.values(state.strategyJournal).some((item) => !item.paused)) {
     const refresh = Object.values(state.strategyJournal).find((item) => !item.paused && !researchRequests.get(item.symbol)?.loading &&
       Date.now() - (researchRequests.get(item.symbol)?.at ?? 0) >= 30 * 60_000);

@@ -185,7 +185,8 @@ function strategyStudy(bars, available, input) {
     const ranked = candidates.filter(({ eligible }) => eligible)
       .sort((left, right) => right.totalReturn - left.totalReturn || left.maxDrawdown - right.maxDrawdown);
     if (ranked.length) chosen = ranked[0].rule;
-    selection = { mode: ranked.length ? 'training-selection' : 'preset-fallback', candidates,
+    selection = { mode: ranked.length ? 'training-selection' : 'preset-fallback',
+      candidates: candidates.map((candidate) => ({ ...candidate, selected: candidate.rule === chosen })),
       reason: ranked.length ? '仅比较训练区。完成交易达到 5 笔后按训练净收益排序，同收益时优先较低回撤，冻结首选后检验一次留出区。'
         : '训练区合格交易样本不足，保留预设参数。' };
   }
@@ -238,8 +239,11 @@ function evidenceText(symbol, data, analysis, comparison, validation, risk) {
   }
   if (validation.status === 'ready') {
     const { fast, slow, breakout, holding, costBps } = validation.settings;
-    lines.push(`规则：MA${fast}/MA${slow}，突破前 ${breakout} 日最高价，下一记录交易日开盘执行，持有 ${holding} 个交易日，单边 ${costBps} 基点。`);
-    lines.push(`留出区 ${validation.sample.holdoutStart} 至 ${validation.sample.holdoutEnd}，${validation.holdout.trades} 笔完整交易，纸面净收益 ${formatPercent(validation.holdout.totalReturn)}。`);
+    const { sample, holdout } = validation;
+    lines.push(`规则：MA${fast}/MA${slow}，突破前 ${breakout} 日最高价，下一条日线开盘仍达突破价才模拟入场，持有 ${holding} 个开盘至开盘时段，单边 ${costBps} 基点。`);
+    lines.push(`留出期 ${sample.holdoutStart} 至 ${sample.holdoutEnd}，${holdout.trades} 笔完整交易，持仓占比 ${formatPercent(holdout.exposure)}。${validation.evidence.detail}`);
+    lines.push(`同标的买入持有对照净收益 ${formatPercent(holdout.baseline.totalReturn)}，与规则使用同一价格序列、区间和单边成本。收益只反映输入价格序列。`);
+    if (holdout.trades) lines.push(`规则净收益 ${formatPercent(holdout.totalReturn)}，较买入持有 ${holdout.excessReturn.toFixed(2)} 个百分点。`);
   } else {
     lines.push(`留出检验：${validation.reason || '暂不可用'}`);
   }
@@ -261,6 +265,11 @@ export function runQuantLab({
   const riskWindows = WINDOWS.map((window) => riskWindow(normalized, window, usable));
   const comparison = benchmarkComparison(normalized, mark, ticker, normalizeTicker(benchmarkSymbol), usable);
   const { study, settings: configured, selection } = strategyStudy(normalized.bars, usable, settings);
+  const trades = study.holdout?.trades;
+  const evidence = study.status !== 'ready' ? { status: 'unavailable', detail: study.reason }
+    : trades === 0 ? { status: 'no-trades', detail: '留出期无完整交易，规则表现与相对收益待验证。' }
+    : trades < 10 ? { status: 'few-trades', detail: '留出期完整交易少于 10 笔，单笔交易可能显著影响结果。' }
+    : { status: 'observed', detail: '留出期结果来自一次时间切分，表现可能受该阶段行情影响。' };
   const audit = auditTrades(normalized.bars, study, configured);
   const coverage = { ...normalized.coverage, fingerprint: usable ? fingerprint(normalized.bars) : null };
   const checks = [
@@ -271,7 +280,7 @@ export function runQuantLab({
       : audit.validSamples === audit.tradeSamples.length ? 'pass' : 'fail',
     detail: audit.tradeSamples.length ? `复算 ${audit.validSamples}／${audit.tradeSamples.length} 笔近期样本的突破条件、时间顺序、实际开盘价与成本。` : '暂无可复算的成交样本。' },
   ];
-  const validation = { status: study.status, reason: study.reason, coverage,
+  const validation = { status: study.status, reason: study.reason, evidence, coverage,
     audit: { checked: audit.tradeSamples.length, passed: audit.validSamples,
       total: (study.train?.trades ?? 0) + (study.holdout?.trades ?? 0) },
     checks, tradeSamples: audit.tradeSamples, assumptions: study.assumptions,
@@ -291,14 +300,13 @@ export function runQuantLab({
         : `20 日波动为 60 日的 ${regime.toFixed(2)} 倍。${regime >= 1.3 ? '短期波动高于较长窗口。' : regime <= .7 ? '短期波动低于较长窗口。' : '两个窗口的波动接近。'}` },
     { key: 'benchmark', label: '相对基准', status: comparison.asset ? 'observed' : 'pending',
       detail: comparison.asset ? `${comparison.benchmark} 同日配对 ${comparison.pairs} 根，区间收益相差 ${comparison.returnGap.toFixed(2)} 个百分点。` : comparison.reason },
-    { key: 'validation', label: '规则留出检验', status: study.status === 'ready' ? 'observed' : 'pending',
-      detail: study.status === 'ready' ? `未参与参数选择的留出区完成 ${study.holdout.trades} 笔交易。当作规则检验样本阅读。` : study.reason },
+    { key: 'validation', label: '规则留出检验', status: evidence.status === 'observed' ? 'observed' : 'pending',
+      detail: trades > 0 ? `留出期完成 ${trades} 笔交易。${evidence.detail}` : evidence.detail },
   ];
   const limitations = [
     '各期收益基于输入价格序列。分红及复权口径仍需核对，观测回撤按收盘标记。',
     '交易时点为下一条完整日线的开盘，缺失交易日与未记录的停牌无法单靠行情文件核对。',
     '旧数据、样本少、集中持仓及未计入的成交成本，会影响历史结果的可用性。',
-    ...(study.holdout && study.holdout.trades < 10 ? ['留出区完整交易少于 10 笔，收益和胜率容易受单笔交易影响。'] : []),
   ];
   return { status: usable ? 'ready' : 'unavailable', symbol: ticker, horizon: analysis.horizon,
     headline: usable ? '本地规则与历史验证' : '等待可核验的历史数据',

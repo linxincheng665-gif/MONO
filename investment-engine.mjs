@@ -20,6 +20,7 @@ const clocks = {
   CN: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
   US: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }),
 };
+const researchPrice = new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 4 });
 
 function numeric(value) {
   if (typeof value !== 'number' && (typeof value !== 'string' || !value.trim())) return null;
@@ -67,6 +68,17 @@ function mean(values) {
 
 function trailingMean(bars, count) {
   return bars.length >= count ? mean(bars.slice(-count).map(({ close }) => close)) : null;
+}
+
+function trendFor(bars, rule) {
+  const close = bars.at(-1)?.close;
+  const fast = trailingMean(bars, rule.fast), slow = trailingMean(bars, rule.slow);
+  const direction = slow === null ? 'unknown' : close >= fast && fast > slow ? 'up'
+    : close <= fast && fast < slow ? 'down' : 'mixed';
+  const requirement = `收盘价 ≥ MA${rule.fast}，且 MA${rule.fast} > MA${rule.slow}`;
+  const detail = direction === 'unknown' ? `至少需要 ${rule.slow} 根完整日线计算 MA${rule.slow}。`
+    : `收盘 ${researchPrice.format(close)}，MA${rule.fast} 为 ${researchPrice.format(fast)}，MA${rule.slow} 为 ${researchPrice.format(slow)}。规则要求${requirement}。`;
+  return { direction, detail, requirement };
 }
 
 function discontinuities(bars) {
@@ -267,7 +279,7 @@ function evidenceChecks(inputs, instrumentType, bars, calendar, records, currenc
   } else if (growth !== null || pe !== null || expense !== null || fair !== null || nav !== null) {
     record('fundamentals', 'watch', '先确认标的是股票还是 ETF，再使用相应研究口径。');
   }
-  const macro = { headwind: 'fail', neutral: 'watch', tailwind: 'pass' };
+  const macro = { headwind: 'fail', neutral: 'pass', tailwind: 'pass' };
   if (Object.hasOwn(macro, inputs.macro)) record('macro', macro[inputs.macro],
     `你的宏观判断为${{ headwind: '逆风', neutral: '中性', tailwind: '顺风' }[inputs.macro]}。`);
   else {
@@ -303,65 +315,92 @@ function evidenceChecks(inputs, instrumentType, bars, calendar, records, currenc
   });
 }
 
-function dataState(bars, quote, calendar, now, historySource, demo, currency) {
-  const last = bars.at(-1);
-  const historyAgeDays = last ? (Date.parse(calendar.day) - Date.parse(last.date)) / dayMs : null;
-  const historyStatus = demo ? 'demo' : !last ? 'missing' : !historySource ? 'unverified'
-    : historyAgeDays > 7 ? 'stale' : bars.length < 31 ? 'thin' : 'ready';
+export function researchQuoteStatus(quote, currency, now, demo = false) {
   const quoteTime = Date.parse(quote?.date ?? '');
   const quoteAgeSeconds = Number.isFinite(quoteTime) ? (now - quoteTime) / 1000 : null;
   const hasPrice = positive(quote?.price) !== null;
   const quoteStatus = demo || quote?.source === 'demo' ? 'demo' : !hasPrice ? 'missing'
     : !['live', 'public'].includes(quote?.source) || (quote.currency && quote.currency !== currency) || quoteAgeSeconds === null
       ? 'unverified' : quoteAgeSeconds < -60 || quoteAgeSeconds > 300 ? 'stale' : 'fresh';
-  return { historyStatus, quoteStatus, historySource, historyAgeDays, quoteAgeSeconds, barCount: bars.length,
+  return { quoteStatus, quoteAgeSeconds };
+}
+
+function dataState(bars, quote, calendar, now, historySource, demo, currency) {
+  const last = bars.at(-1);
+  const historyAgeDays = last ? (Date.parse(calendar.day) - Date.parse(last.date)) / dayMs : null;
+  const historyStatus = demo ? 'demo' : !last ? 'missing' : !historySource ? 'unverified'
+    : historyAgeDays > 7 ? 'stale' : bars.length < 31 ? 'thin' : 'ready';
+  return { historyStatus, ...researchQuoteStatus(quote, currency, now, demo), historySource, historyAgeDays, barCount: bars.length,
     lastDate: last?.date ?? null, lastBarDate: last?.date ?? null, quoteDate: quote?.date ?? null };
 }
 
-function statusFor(rule, bars, observed, freshness, quote, checks, type, splitDates, volumeRatio, held) {
+function statusFor(rule, observed, freshness, quote, checks, type, splitDate, volumeRatio, held, trend) {
   const bracket = observed?.bracket;
-  if (freshness.historyStatus !== 'ready' || bars.length < rule.slow + 1 || freshness.quoteStatus === 'demo') {
-    return { status: 'blocked', action: '补齐数据', reason: '需要足量、有来源且近期完成的日线。演示数据不生成交易条件。' };
+  const result = (status, action, reason, next, nextView = 'basis', position = {}) =>
+    ({ status, action, reason, next, nextView, ...position });
+  if (freshness.historyStatus !== 'ready' || freshness.barCount < rule.slow + 1 || freshness.quoteStatus === 'demo') {
+    const reason = freshness.quoteStatus === 'demo' ? '当前报价来自演示数据。'
+      : freshness.historyStatus === 'stale' ? `末根日线为 ${freshness.lastDate}，已超过 7 个自然日。`
+      : freshness.historyStatus === 'unverified' ? '日线数据缺少来源。'
+      : `${rule.label}判断需要 ${rule.slow + 1} 根完整日线，当前有 ${freshness.barCount} 根。`;
+    return result('blocked', '补齐数据', reason, '更新有来源的日线及报价后重新判断。', 'evidence');
   }
-  if (splitDates.some((date) => date >= bars.at(-(rule.slow + 1)).date)) {
-    return { status: 'blocked', action: '核对价格口径', reason: '观察窗内有异常隔夜价差，需先核对拆股、复权或数据缺口。' };
+  if (splitDate) {
+    return result('blocked', '核对价格口径', `${splitDate} 出现异常隔夜价差。`,
+      '核对拆股、复权口径或缺失日线后重新计算。', 'evidence');
   }
   const invalidation = held ? observed?.support : bracket?.stop;
   if (Number.isFinite(invalidation) && freshness.quoteStatus === 'fresh' && Number(quote.price) <= invalidation) {
-    if (held) return { status: 'invalidated', action: '复核减仓或退出', positionAction: 'review-exit',
-      positionLevel: invalidation, reason: '最新报价已触及或跌破已观察支撑。复核持仓依据、预设失效价及可成交价格。' };
-    return { status: 'invalidated', action: '取消观察计划', reason: '当前报价已触及观察窗的已知支撑，原入场条件失效。' };
+    if (held) return result('invalidated', '复核减仓或退出', '最新报价已触及或跌破已观察支撑。',
+      '核对持仓依据、预设失效价和可成交价格。', 'basis', { positionAction: 'review-exit', positionLevel: invalidation });
+    return result('invalidated', '取消观察计划', '最新报价已触及或跌破已观察支撑。',
+      '等待新的日线结构形成，再确认观察区间与失效价。', 'tracking');
   }
-  if (checks.events === 'fail') return { status: 'wait', action: '等待事件明朗', reason: '研究记录显示重大事件仍构成阻碍。' };
+  const check = (key) => checks.find((item) => item.key === key);
+  if (check('events').status === 'fail') {
+    return result('wait', '等待事件明朗', '研究记录显示重大事件仍构成阻碍。', '核对事件结果并更新事件判断。');
+  }
   if (!bracket || bracket.ratio < 1.5) {
-    return { status: 'wait', action: '继续观察价格', reason: '已观察价位无法构成至少 1.5 倍的计划盈亏比。' };
+    const reason = bracket ? `情景盈亏比为 ${bracket.ratio.toFixed(2)} 倍，低于规则的 1.50 倍。`
+      : '当前观察窗缺少一组可复核的入场区间、支撑或目标价。';
+    return result('wait', '继续观察价格', reason, '等待新价位形成后复算盈亏比。', 'tracking');
   }
-  const fast = trailingMean(bars, rule.fast), slow = trailingMean(bars, rule.slow);
-  if (fast <= slow || bars.at(-1).close < fast) {
-    return { status: 'watch', action: '跟踪趋势修复', reason: `最近收盘尚未同时满足收盘 ≥ MA${rule.fast}，且 MA${rule.fast} > MA${rule.slow}。` };
+  if (trend.direction !== 'up') {
+    return result('watch', '跟踪趋势修复', trend.detail, `等待完整日线满足${trend.requirement}。`);
   }
   if (rule.key === 'short' && volumeRatio !== null && volumeRatio < .65) {
-    return { status: 'watch', action: '等待流动性恢复', reason: '最近完整日线的成交量低于此前 20 日均量的 65%。' };
+    return result('watch', '等待成交量恢复', `最近完整日线成交量为此前 20 日均量的 ${(volumeRatio * 100).toFixed(0)}%。`,
+      '观察完整日线成交量能否恢复到此前 20 日均量的 65%。');
   }
   if (freshness.quoteStatus !== 'fresh') {
-    return { status: 'watch', action: '等待可核对报价', reason: '价位来自历史日线。当前报价不足以确认入场区间。' };
+    return result('watch', '等待可核对报价', '观察区间来自历史日线，当前报价不足以确认是否入场。',
+      '等可核验报价更新后，核对价格是否进入观察区间。', 'evidence');
   }
-  const pendingEvents = checks.events !== 'pass';
-  const pendingContext = rule.key !== 'short' && (checks.macro !== 'pass' || checks.valuation !== 'pass');
-  const pendingLongTerm = rule.key === 'long' && (!type || checks.fundamentals !== 'pass');
-  const pendingEvidence = pendingEvents || pendingContext || pendingLongTerm || checks.sentiment === 'fail';
+  const required = rule.key === 'short' ? ['events'] : rule.key === 'mid'
+    ? ['events', 'macro', 'valuation'] : ['events', 'macro', 'valuation', 'fundamentals'];
+  const missing = required.map(check).filter(({ status }) => status !== 'pass').map(({ label }) => label);
+  if (rule.key === 'long' && !type) missing.push('资产类型');
+  if (check('sentiment').status === 'fail') missing.push('市场情绪');
+  const evidenceNext = missing.length ? `复核${missing.join('、')}。` : '';
   const price = Number(quote.price);
   if (price < bracket.entryZone.low || price > bracket.entryZone.high) {
-    if (held && !pendingEvidence) return { status: 'watch', action: '条件持有，暂缓加仓', positionAction: 'hold', positionLevel: invalidation,
-      reason: '最新报价仍在已观察支撑之上，趋势条件仍成立。报价位于加仓观察区之外，继续跟踪支撑和事件。' };
-    return { status: 'watch', action: '等待回踩观察区', reason: '当前报价位于观察区之外。保持原失效价和目标价。' };
+    const above = price > bracket.entryZone.high;
+    const direction = above ? '高于' : '低于';
+    const waiting = above ? '等待报价回到区间，再复核剩余盈亏比。' : '等待报价回到区间，同时跟踪与失效价的距离。';
+    if (held && !missing.length) return result('watch', '继续跟踪持仓，暂缓加仓',
+      `最新报价仍在支撑之上，${direction}加仓观察区间。`, waiting, 'tracking',
+      { positionAction: 'hold', positionLevel: invalidation });
+    return result('watch', '等待报价进入观察区', `当前报价${direction}观察区间。`,
+      waiting + evidenceNext, missing.length ? 'basis' : 'tracking');
   }
-  if (pendingEvidence) {
-    return { status: 'watch', action: '复核研究依据', reason: '价格进入观察区。该周期的事件、宏观、估值、基本面或情绪条件仍需复核。' };
+  if (missing.length) {
+    return result('watch', '复核研究依据', `报价已进入观察区间，${missing.join('、')}仍待确认。`, evidenceNext);
   }
-  if (held) return { status: 'opportunity', action: '条件持有，复核加仓额度', positionAction: 'hold',
-    positionLevel: invalidation, reason: '本周期条件已满足，原持仓观察依据仍成立。加仓前以现有仓位、现金储备和风险预算核对额度。' };
-  return { status: 'opportunity', action: '核对条件后评估仓位', reason: '报价进入已观察的价格区间，趋势和本周期所需证据满足预设规则。' };
+  if (held) return result('opportunity', '复核加仓额度', '报价在观察区间内，当前周期的趋势和研究条件已满足。',
+    '按现有仓位、现金储备和风险预算核对加仓额度。', 'basis',
+    { positionAction: 'hold', positionLevel: invalidation });
+  return result('opportunity', '核对计划仓位', '报价在观察区间内，当前周期的趋势和研究条件已满足。',
+    '核对预算内数量、失效价与实际可成交价格。');
 }
 
 function scenarioList(horizon) {
@@ -376,40 +415,12 @@ function scenarioList(horizon) {
   ];
 }
 
-function estimateSize(portfolio, bracket, currency, metadata, demo) {
-  const cash = numeric(portfolio.cash);
-  const equity = positive(portfolio.equity);
-  if (demo || portfolio.incomplete || cash === null || cash < 0 || !equity || !bracket) return null;
-  const explicitRisk = numeric(portfolio.riskPercent);
-  const riskPercent = explicitRisk ?? 1;
+function estimateSize(portfolio, bracket, symbol, metadata) {
   const weight = numeric(portfolio.weight ?? portfolio.currentWeight);
-  const capPercent = numeric(portfolio.capPercent);
-  const reservePercent = numeric(portfolio.reservePercent);
-  const percentValid = (value) => value === null || (value >= 0 && value <= 100);
-  if (riskPercent <= 0 || riskPercent > 100 || ![capPercent, reservePercent].every(percentValid)
-    || (capPercent !== null && weight === null)) return null;
-  const cashReserved = equity * (reservePercent ?? 0) / 100;
-  const afterReserve = Math.max(0, cash - cashReserved);
-  const allocationCapacity = capPercent === null ? null : Math.max(0, (capPercent - weight) / 100 * equity);
-  const amount = Math.min(numeric(portfolio.amount) ?? cash, afterReserve, allocationCapacity ?? Infinity);
-  if (amount <= 0) {
-    return { valid: false, shares: 0, investment: 0, risk: 0, reward: 0, ratio: bracket.ratio,
-      riskPercent, riskPercentAssumed: explicitRisk === null, budget: equity * riskPercent / 100,
-      postWeight: weight, cashReserved, allocationCapacity,
-      note: '在可用现金、目标现金储备和单标的仓位上限内无可投入金额。' };
-  }
-  const result = tradePlan({ ...bracket, amount, riskPercent,
-    cash, equity, fractional: currency === 'USD' && portfolio.fractional === true });
-  if (!result.valid) return null;
-  const lot = positive(metadata.lotSize);
-  const shares = lot && Number.isInteger(lot) ? Math.floor(result.shares / lot) * lot : result.shares;
-  const investment = shares * bracket.entry;
-  return { ...result, shares, investment, riskPercent, riskPercentAssumed: explicitRisk === null,
-    cashReserved, allocationCapacity, risk: shares * result.riskPerShare,
-    reward: shares * result.rewardPerShare,
-    postWeight: weight === null ? null : weight + investment / equity * 100,
-    unit: lot ? `每单位 ${lot} 股` : currency === 'USD' && portfolio.fractional ? '碎股估算' : '整股估算',
-    note: '按区间上沿、止损价和当前可用现金估算。成交单位、跳空和滑点会影响结果。' };
+  const equity = positive(portfolio.equity);
+  const positionValue = portfolio.positionValue ?? (weight === null || equity === null ? null : equity * weight / 100);
+  return { ...tradePlan({ ...portfolio, ...bracket, symbol, positionValue, riskPercent: portfolio.riskPercent ?? 1,
+    lotSize: numeric(metadata.lotSize) }), demo: portfolio.demo };
 }
 
 function manualScenarioFor(inputs) {
@@ -426,6 +437,18 @@ function manualScenarioFor(inputs) {
 
 function rollingAverage(bars, end, count) {
   return mean(bars.slice(end + 1 - count, end + 1).map(({ close }) => close));
+}
+
+function passiveSegment(bars, first, end, friction) {
+  const entryCost = bars[first].open * (1 + friction);
+  const terminalValue = bars[end - 1].open * (1 - friction) / entryCost;
+  let peak = 1, maxDrawdown = 0;
+  for (let session = first; session < end - 1; session += 1) {
+    const value = bars[session].close / entryCost;
+    peak = Math.max(peak, value);
+    maxDrawdown = Math.max(maxDrawdown, 1 - value / peak);
+  }
+  return { totalReturn: (terminalValue - 1) * 100, maxDrawdown: Math.max(maxDrawdown, 1 - terminalValue / peak) * 100 };
 }
 
 function simulateSegment(bars, first, end, rule, friction) {
@@ -452,8 +475,12 @@ function simulateSegment(bars, first, end, rule, friction) {
     completed.push({ signalDate: signal.date, entryDate: enter.date, exitDate: exit.date, returnPercent: change * 100 });
     i += rule.holding;
   }
+  const baseline = passiveSegment(bars, first, end, friction);
+  const totalReturn = completed.length ? (equity - 1) * 100 : null;
   return { trades: completed.length, winRate: completed.length ? completed.filter(({ returnPercent }) => returnPercent > 0).length / completed.length * 100 : null,
-    totalReturn: completed.length ? (equity - 1) * 100 : null, maxDrawdown: completed.length ? maxDrawdown * 100 : null,
+    totalReturn, maxDrawdown: completed.length ? maxDrawdown * 100 : null, baseline,
+    exposure: completed.length * rule.holding / (end - first - 1) * 100,
+    excessReturn: totalReturn === null ? null : totalReturn - baseline.totalReturn,
     averageTrade: mean(completed.map(({ returnPercent }) => returnPercent)), recent: completed.slice(-5) };
 }
 
@@ -463,17 +490,19 @@ export function walkForwardTradeRule(bars, rule = horizonRules[1], { demo = fals
   const modeledCost = Math.max(0, Math.min(1000, numeric(costBps) ?? 10));
   const assumptions = [
     '按日期先后切分约 70% 训练区和 30% 留出区。两个区间使用事先确定的相同参数，各自统计。',
-    `每根完整日线收盘后检查前 ${breakout} 日最高价及 MA${rule.fast}/MA${rule.slow}，下一交易日实际开盘才可能入场，持有 ${rule.holding} 个交易日后按开盘退出。`,
-    '单一多头仓位，全额纸面复利。本规则检验突破条件，与本页的回踩观察情景分开。',
-    `每边成本 ${modeledCost} 个基点，以日收盘估算过程回撤。未模拟分红、税费差异、涨跌停、成交量限制及盘中回撤。`,
+    `每根完整日线收盘后检查前 ${breakout} 日最高价及 MA${rule.fast}/MA${rule.slow}。下一条日线开盘仍在突破价之上或持平时模拟入场，持有 ${rule.holding} 个开盘至开盘时段，仅统计在区间内完成的交易。`,
+    '单一多头仓位，空仓期按零现金收益处理。持仓占比按区间内开盘至下一开盘的时段计算。',
+    '买入持有对照在每段首日开盘买入、末日开盘卖出，采用同一价格序列及相同的单边成本。',
+    `每边成本 ${modeledCost} 个基点，按开盘成交和持有期收盘估算回撤。收益仅反映输入价格序列。模型未模拟分红、税费差异、涨跌停、成交量限制及盘中回撤。`,
   ];
   const boundary = Math.floor(bars.length * .7);
   const sample = { total: bars.length, training: boundary, holdout: bars.length - boundary,
-    trainingEnd: bars[boundary - 1]?.date ?? null, holdoutStart: bars[boundary]?.date ?? null, holdoutEnd: bars.at(-1)?.date ?? null };
+    trainingStart: boundary ? bars[0].date : null, trainingEnd: bars[boundary - 1]?.date ?? null,
+    holdoutStart: bars[boundary]?.date ?? null, holdoutEnd: bars.at(-1)?.date ?? null };
   const checkedBars = trainingOnly ? bars.slice(0, boundary) : bars;
   const unavailable = (reason) => ({ status: 'unavailable', reason, sample, assumptions, train: null, holdout: null, costBps: modeledCost });
   if (demo) return unavailable('演示序列不参与历史检验。');
-  if (!checkedBars.every(({ open, high, low }) => [open, high, low].every(Number.isFinite))) {
+  if (!checkedBars.every(({ open, high, low, close }) => [open, high, low, close].every((price) => Number.isFinite(price) && price > 0))) {
     return unavailable('历史检验需要完整、连续记录的真实日线 OHLC。');
   }
   if (checkedBars.some((bar, index) => index && Date.parse(bar.date) - Date.parse(checkedBars[index - 1].date) > 14 * dayMs)) {
@@ -509,41 +538,51 @@ export function runInvestmentResearch({
   const marketRatios = instrumentType === 'equity' ? quoteFacts?.ratios ?? [] : [];
   evidence.valuation.unshift(...marketRatios);
   const checks = evidenceChecks(inputs, instrumentType, daily, calendar, evidence, currency, marketRatios);
-  const statuses = Object.fromEntries(checks.map(({ key, status }) => [key, status]));
   const technical = technicalState(daily, benchmark);
   const data = dataState(daily, quote, calendar, time, historySource, demo, currency);
   const splitDates = discontinuities(daily);
-  const held = !demo && portfolio.incomplete === false && positive(portfolio.weight ?? portfolio.currentWeight) !== null;
+  const held = !demo && !portfolio.demo && (positive(portfolio.positionValue) !== null
+    || positive(portfolio.weight ?? portfolio.currentWeight) !== null);
   const horizons = horizonRules.map((rule) => {
-    const observed = data.historyStatus === 'ready' && data.quoteStatus !== 'demo' ? observedLevels(daily, rule) : null;
+    const trend = trendFor(daily, rule);
+    const enoughData = data.historyStatus === 'ready' && data.quoteStatus !== 'demo' && daily.length >= rule.slow + 1;
+    const splitDate = enoughData && splitDates.at(-1) >= daily.at(-(rule.slow + 1)).date ? splitDates.at(-1) : null;
+    const observed = enoughData && !splitDate ? observedLevels(daily, rule) : null;
     const bracket = observed?.bracket;
-    const decision = statusFor(rule, daily, observed, data, quote, statuses, instrumentType, splitDates, technical.volumeRatio, held);
+    const decision = statusFor(rule, observed, data, quote, checks, instrumentType, splitDate, technical.volumeRatio, held, trend);
     const stop = bracket?.stop ?? (held ? observed?.support : null) ?? null;
-    return { key: rule.key, label: rule.label, sessions: rule.sessions, ...decision,
+    return { key: rule.key, label: rule.label, sessions: rule.sessions, ...decision, trend,
       entryZone: bracket?.entryZone ?? null, entry: bracket?.entry ?? null, target: bracket?.target ?? null,
       stop, ratio: bracket?.ratio ?? null, levels: bracket?.levels ?? null,
       support: observed?.support ?? null, resistance: observed?.resistance ?? null,
-      trigger: bracket ? `报价回到观察区、收盘站上 MA${rule.fast}，且 MA${rule.fast} > MA${rule.slow}。` : '等待可复核的历史入场区间与目标。',
+      trigger: decision.next,
       invalidation: stop === null ? '尚无可核对的失效价。'
         : held ? '报价触及或跌破此前局部低点时，复核持仓依据。' : '报价触及或跌破此前局部低点，原观察计划失效。' };
   });
   const selected = horizons.find(({ key }) => key === inputs.horizon) ?? horizons[1];
   technical.support = selected.support;
   technical.resistance = selected.resistance;
+  const selectedRule = horizonRules.find(({ key }) => key === selected.key);
   const dataNote = data.historyStatus === 'ready' ? `已完成日线 ${data.barCount} 根，末日 ${data.lastDate}。`
     : { missing: '等待可用日线。', demo: '当前为演示数据。', unverified: '待确认历史行情来源。', stale: '日线超过 7 个自然日未更新。', thin: '至少需要 31 根完整日线。' }[data.historyStatus];
+  const enoughBars = data.barCount >= selectedRule.slow + 1;
+  const shortVolume = selectedRule.key === 'short' && technical.volumeRatio !== null;
   const conditions = [
-    { key: 'history', label: '数据依据', detail: dataNote, status: data.historyStatus === 'ready' ? 'pass' : 'pending' },
-    { key: 'trend', label: '技术趋势', detail: { up: '收盘 ≥ MA20 ≥ MA50。', down: '收盘 ≤ MA20 ≤ MA50。', mixed: '收盘与两条均线方向未一致。', unknown: 'MA20／MA50 所需样本不足。' }[technical.trend],
-      status: { up: 'pass', down: 'fail', mixed: 'watch', unknown: 'pending' }[technical.trend] },
+    { key: 'history', label: '数据依据', detail: dataNote + (data.historyStatus === 'ready' && !enoughBars
+      ? `${selected.label}价位判断需要 ${selectedRule.slow + 1} 根完整日线。` : ''),
+      status: selected.status === 'blocked' ? 'pending' : 'pass' },
+    { key: 'trend', label: `${selected.label}趋势`, detail: selected.trend.detail,
+      status: { up: 'pass', down: 'fail', mixed: 'watch', unknown: 'pending' }[selected.trend.direction] },
     { key: 'volume', label: '相对成交量', detail: technical.volumeRatio === null ? '核对最近日线与此前 20 日成交量后可计算。'
-      : `最近成交量为此前 20 日平均的 ${technical.volumeRatio.toFixed(2)} 倍。`, status: technical.volumeRatio === null ? 'pending' : 'watch' },
+      : `最近成交量为此前 20 日平均的 ${technical.volumeRatio.toFixed(2)} 倍。${shortVolume ? '短线规则至少需要 0.65 倍。' : ''}`,
+      status: technical.volumeRatio === null ? 'pending' : shortVolume ? technical.volumeRatio >= .65 ? 'pass' : 'fail' : 'watch' },
     ...checks,
   ];
   const manualScenario = manualScenarioFor(inputs);
   const display = manualScenario?.valid ? manualScenario : selected;
   const canTransfer = Boolean(normalized && (manualScenario?.valid || selected.status === 'opportunity'));
-  const sized = display.entry !== null ? estimateSize(portfolio, display, currency, metadata, demo) : null;
+  const sized = display.entry !== null && !demo && (manualScenario?.valid || selected.status !== 'invalidated')
+    ? estimateSize(portfolio, display, normalized, metadata) : null;
   const plan = display.entry !== null ? { entryZone: display.entryZone, entry: display.entry, stop: display.stop,
     target: display.target, ratio: display.ratio, size: sized, levels: display.levels,
     source: manualScenario?.valid ? 'manual' : 'observed' } : null;
@@ -552,16 +591,16 @@ export function runInvestmentResearch({
     ...(data.quoteStatus !== 'fresh' ? ['当前报价不可用于确认入场。'] : []),
     ...(technical.relativeStrength === null ? ['缺少近 21 个共同交易日的基准，暂不判断相对强弱。'] : []),
     ...(splitDates.length ? ['历史序列出现异常隔夜价差，跨口径的历史回放暂不可用。'] : []),
-    ...(sized === null ? ['仓位估算需要完整的同币种组合、现金与风险预算。'] : []),
+    ...(sized?.error ? [sized.error] : []),
     ...(manualScenario?.valid ? ['当前仓位计算使用手动假设。市场机会状态仍按实际行情和研究依据独立判断。'] : []),
   ];
   return { symbol: normalized, market, currency, instrumentType, data, technical, evidence, conditions, horizons, horizon: selected.key,
-    decision: { status: selected.status, action: selected.action, reason: selected.reason,
+    decision: { status: selected.status, action: selected.action, reason: selected.reason, next: selected.next, nextView: selected.nextView,
       positionAction: selected.positionAction ?? null, positionLevel: selected.positionLevel ?? null },
     summary: manualScenario?.valid === false ? manualScenario.reason : selected.reason,
     entry: display.entry, target: display.target, stop: display.stop, ratio: display.ratio,
     canTransfer, levelSource: canTransfer ? plan?.source : null, plan, manualScenario,
     scenarios: scenarioList(selected), uncertainty,
-    ...(includeBacktest ? { backtest: walkForwardTradeRule(daily, horizonRules.find(({ key }) => key === selected.key),
+    ...(includeBacktest ? { backtest: walkForwardTradeRule(daily, selectedRule,
       { demo: demo || !historySource, costBps: inputs.costBps ?? 10 }) } : {}) };
 }

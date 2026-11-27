@@ -43,6 +43,15 @@ export function instrumentCurrency(symbol) {
   return instrumentMarket(symbol) === 'CN' ? 'CNY' : 'USD';
 }
 
+export function buyQuantityRules(symbol, fractional = false) {
+  const local = canonicalChina.exec(normalizeTicker(symbol));
+  if (!local) return fractional ? { minimum: .0001, increment: .0001 } : { minimum: 1, increment: 1 };
+  const [, code, exchange] = local;
+  if (exchange === 'SH' && /^68[89]/.test(code)) return { minimum: 200, increment: 1 };
+  if (exchange === 'BJ') return { minimum: 100, increment: 1 };
+  return { minimum: 100, increment: 100 };
+}
+
 export function marketLabel(symbol) {
   const local = canonicalChina.exec(normalizeTicker(symbol));
   return local ? chinaLabels[local[2]] : '美股';

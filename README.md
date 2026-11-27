@@ -1,6 +1,6 @@
 # MONO
 
-MONO 是面向个人投资者的研究终端，支持 Web、Android 和 Windows。当前源码版本为 3.3.1。
+MONO 是面向个人投资者的研究终端，支持 Web、Android 和 Windows。当前源码版本为 3.3.2。
 
 ## 功能
 
@@ -32,7 +32,7 @@ npm start
 .\android\build.ps1
 ```
 
-脚本会在本机创建用于签名的文件，并在仓库根目录生成 `MONO-3.3.1.apk`。更新本机此前构建的 APK 时，需使用原签名。
+脚本会在本机创建用于签名的文件，并在仓库根目录生成 `MONO-3.3.2.apk`。更新本机此前构建的 APK 时，需使用原签名。
 
 ### Windows x64
 
@@ -42,7 +42,7 @@ npm start
 .\windows\build.ps1 -WebViewPackage "C:\path\to\Microsoft.Web.WebView2.nupkg"
 ```
 
-解压生成的 `MONO-3.3.1-Windows.zip`，打开 `MONO.exe`。
+解压生成的 `MONO-3.3.2-Windows.zip`，打开 `MONO.exe`。
 
 ## 数据与配置
 

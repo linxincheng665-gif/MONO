@@ -1,18 +1,42 @@
-import { instrumentMarket } from './instruments.mjs';
+import { buyQuantityRules, instrumentCurrency, instrumentMarket } from './instruments.mjs';
+import { researchQuoteStatus } from './investment-engine.mjs';
+import { tradePlan } from './model.mjs';
 
 const finite = Number.isFinite;
 export const STRATEGY_LIMIT = 12;
 const MAX_HISTORY = 24;
 const MAX_ALERTS = 40;
+const maxHistoryGap = 14 * 86_400_000;
+const historyClocks = {
+  CN: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }),
+  US: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }),
+};
 
-function dateCloses(history, today) {
-  return new Map((history ?? []).filter(({ date, close }) => /^\d{4}-\d{2}-\d{2}$/.test(date) && date < today && finite(close) && close > 0)
+function historyCutoff(symbol, now) {
+  const market = instrumentMarket(symbol);
+  const date = new Date(now);
+  const fields = Object.fromEntries(historyClocks[market].formatToParts(finite(date.getTime()) ? date : Date.now())
+    .map(({ type, value }) => [type, value]));
+  return { day: `${fields.year}-${fields.month}-${fields.day}`, closed: Number(fields.hour) >= (market === 'CN' ? 15 : 16) };
+}
+
+function dateCloses(history, { day, closed }) {
+  return new Map((history ?? []).filter(({ date, close, complete }) => /^\d{4}-\d{2}-\d{2}$/.test(date)
+    && (date < day || date === day && closed) && complete !== false && finite(close) && close > 0)
     .map(({ date, close }) => [date, close]));
 }
 
-function aligned(maps) {
-  if (!maps.length) return [];
-  return [...maps[0].keys()].filter((date) => maps.every((map) => map.has(date))).sort().slice(-121);
+function aligned(maps, reference = new Map()) {
+  if (!maps.length || maps.some((map) => !map.size)) return [];
+  const dates = [...new Set([...maps, reference].flatMap((map) => [...map.keys()]))].sort();
+  const days = [];
+  for (let i = dates.length - 1; i >= 0 && days.length < 121; i--) {
+    const date = dates[i];
+    if (days.length && Date.parse(days.at(-1)) - Date.parse(date) > maxHistoryGap) break;
+    if (maps.every((map) => map.has(date))) days.push(date);
+    else if (days.length) break;
+  }
+  return days.reverse();
 }
 
 function returns(closes, days) {
@@ -53,17 +77,17 @@ function groupPositions(rows, total) {
   }));
 }
 
-export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, maxCashTarget = 20 } = {}) {
-  const { total, cash, incomplete } = summary;
-  if (!finite(total) || total <= 0) return { empty: true };
-  const exposures = groupPositions(summary.rows, total);
-  const today = new Date().toISOString().slice(0, 10);
-  for (const item of exposures) item.closes = dateCloses(histories[item.symbol], today);
+export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, maxCashTarget = 20, now = Date.now() } = {}) {
+  const { total, cash, positions: exposures, incomplete } = portfolioValuation(summary);
+  if (total <= 0) return { empty: true };
+  const cutoff = historyCutoff(exposures[0]?.symbol, now);
+  for (const item of exposures) item.closes = dateCloses(histories[item.symbol], cutoff);
   const capPercent = finite(cap) && cap >= 1 && cap <= 100 ? cap : 25;
   const reservePercent = finite(maxCashTarget) && maxCashTarget >= 0 && maxCashTarget <= 100 ? maxCashTarget : 20;
   const largest = exposures[0];
   const over = exposures.filter(({ weight }) => weight > capPercent);
   const riskPairs = [];
+  let usablePairs = 0;
   // Coverage is deliberately bounded to the 16 largest exposures.
   const reviewed = exposures.slice(0, 16);
   for (const [i, left] of reviewed.entries()) {
@@ -74,6 +98,7 @@ export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, m
       const b = returns(right.closes, days);
       const denom = Math.sqrt(covariance(a, a) * covariance(b, b));
       if (!(denom > 0)) continue;
+      usablePairs++;
       const coefficient = Math.max(-1, Math.min(1, covariance(a, b) / denom));
       if (coefficient >= .75) riskPairs.push({ left: left.symbol, right: right.symbol, coefficient, observations: a.length, exposure: left.weight + right.weight });
     }
@@ -100,7 +125,8 @@ export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, m
       before: historicalStats(series, weights), after: rebalance ? historicalStats(series, next) : null };
   }
   return { incomplete, cap: capPercent, cashPct, reserve: reservePercent, deployable: incomplete ? null : Math.max(0, cash - total * reservePercent / 100),
-    largest: largest?.symbol, over: over.length, pairs: riskPairs.slice(0, 3), pairedCoverage: reviewed.length, holdings: exposures.length, rebalance, scenario, history };
+    largest: largest?.symbol, over: over.length, pairs: riskPairs.slice(0, 3), pairedCoverage: reviewed.length,
+    usablePairs, possiblePairs: reviewed.length * (reviewed.length - 1) / 2, holdings: exposures.length, rebalance, scenario, history };
 }
 
 function pct(value, total) {
@@ -109,6 +135,28 @@ function pct(value, total) {
 
 function bounded(value, low, high, fallback) {
   return finite(value) && value >= low && value <= high ? value : fallback;
+}
+
+function portfolioValuation(summary) {
+  const cash = bounded(summary.cash, 0, Number.MAX_VALUE, 0);
+  const symbols = new Set();
+  const missing = new Set();
+  const valued = [];
+  for (const row of summary.rows ?? []) {
+    if (!finite(row.shares) || row.shares <= 0) continue;
+    symbols.add(row.symbol);
+    if (finite(row.value) && row.value > 0 && row.source !== 'demo') valued.push(row);
+    else missing.add(row.symbol);
+  }
+  const total = cash + valued.reduce((sum, { value }) => sum + value, 0);
+  const positions = groupPositions(valued, total).map((position) => ({
+    ...position, partial: missing.has(position.symbol),
+  }));
+  const totalPositions = symbols.size;
+  return {
+    cash, total, positions, totalPositions, fullyValuedPositions: totalPositions - missing.size,
+    incomplete: Boolean(summary.incomplete || missing.size),
+  };
 }
 
 function concentrationFor(positions, cash, total, cap, reserve) {
@@ -122,10 +170,10 @@ function concentrationFor(positions, cash, total, cap, reserve) {
   };
 }
 
-function stressFor(positions, total, marketShock, specificSymbol, specificShock, totalPositions) {
-  const contributions = positions.map(({ symbol, value, weight }) => {
+function stressFor(positions, total, marketShock, specificSymbol, specificShock) {
+  const contributions = positions.filter(({ value }) => value > 0).map(({ symbol, value, weight, partial }) => {
     const shock = symbol === specificSymbol ? specificShock : marketShock;
-    return { symbol, value, weight, shock, pnl: value * shock / 100 };
+    return { symbol, value, weight, shock, partial, pnl: value * shock / 100 };
   });
   const pnl = contributions.reduce((sum, item) => sum + item.pnl, 0);
   const grossLoss = contributions.reduce((sum, item) => sum + Math.max(0, -item.pnl), 0);
@@ -134,26 +182,25 @@ function stressFor(positions, total, marketShock, specificSymbol, specificShock,
     const pnl = invested * shock / 100;
     return { shock, pnl, changePercent: pct(pnl, total) };
   });
-  const valuedPositions = positions.length;
   return {
     marketShock, specificSymbol, specificShock, pnl, totalAfter: total + pnl, changePercent: pct(pnl, total),
-    presets, valuedPositions, totalPositions, coveragePercent: totalPositions ? pct(valuedPositions, totalPositions) : null,
+    presets, grossLoss, grossGain: contributions.reduce((sum, item) => sum + Math.max(0, item.pnl), 0),
     contributions: contributions.sort((left, right) => left.pnl - right.pnl).map((item) => ({
       ...item, lossShare: grossLoss > 0 ? pct(Math.max(0, -item.pnl), grossLoss) : 0,
     })),
   };
 }
 
-function replayHistory(positions, histories, today, total, updated, benchmarkBars) {
+function replayHistory(positions, histories, cutoff, total, updated, benchmarkBars) {
   if (!positions.length || positions.length > 16) return null;
-  const closes = positions.map(({ symbol }) => dateCloses(histories[symbol], today));
-  const days = aligned(closes);
+  const closes = positions.map(({ symbol }) => dateCloses(histories[symbol], cutoff));
+  const benchmark = dateCloses(benchmarkBars, cutoff);
+  const days = aligned(closes, benchmark);
   if (days.length < 41) return null;
   const series = closes.map((map) => returns(map, days));
   const weights = positions.map(({ value }) => value / total);
   const before = historicalStats(series, weights);
   const after = updated ? historicalStats(series, updated.map(({ value }) => value / total)) : null;
-  const benchmark = dateCloses(benchmarkBars, today);
   const matched = aligned([...closes, benchmark]);
   let reference = null;
   if (matched.length >= 41) {
@@ -166,7 +213,7 @@ function replayHistory(positions, histories, today, total, updated, benchmarkBar
   return { from: days[0], through: days.at(-1), observations: days.length - 1, before, after, reference };
 }
 
-function simulateWeight(positions, histories, benchmarkBars, today, { total, cash, incomplete }, options) {
+function simulateWeight(positions, histories, benchmarkBars, cutoff, { total, cash, incomplete }, options) {
   const { cap, reserve, stress, draft } = options;
   if (!draft?.symbol) return { status: 'unset' };
   const { symbol, targetWeight } = draft;
@@ -180,17 +227,25 @@ function simulateWeight(positions, histories, benchmarkBars, today, { total, cas
   const direction = Math.sign(difference);
   const request = Math.abs(difference);
   const available = Math.max(0, cash - total * reserve / 100);
-  const changing = direction > 0 ? Math.min(request, available) : request;
-  const market = instrumentMarket(symbol);
-  const lot = market === 'CN' ? 100 : .0001;
-  const lots = changing / position.price / lot;
-  const rounded = Math.floor(lots + Number.EPSILON * Math.max(1, lots) * 4) * lot;
+  const capRoom = Math.max(0, total * cap / 100 - position.value);
+  const changing = direction > 0 ? Math.min(request, available, capRoom) : request;
+  const quantity = direction > 0 ? buyQuantityRules(symbol, true) : null;
+  const increment = quantity?.increment ?? (instrumentMarket(symbol) === 'CN' ? 100 : .0001);
+  const units = changing / position.price / increment;
+  const rounded = Number((Math.floor(units + Number.EPSILON * Math.max(1, units) * 4) * increment).toFixed(4));
   const closing = direction < 0 && targetWeight === 0;
-  const shares = closing ? position.shares : Math.min(direction < 0 ? position.shares : Infinity, Number(rounded.toFixed(4)));
+  const shares = closing ? position.shares : direction < 0 ? Math.min(position.shares, rounded)
+    : rounded >= quantity?.minimum ? rounded : 0;
   const amount = shares * position.price;
   const delta = direction * amount;
   const nextCash = Math.max(0, cash - delta);
-  const limit = request > changing + 1e-8 ? 'reserve' : changing > amount + 1e-8 ? 'lot' : null;
+  const limits = [
+    ...(direction > 0 && request > capRoom + 1e-8 ? ['cap'] : []),
+    ...(direction > 0 && request > available + 1e-8 ? ['reserve'] : []),
+    ...(changing > amount + 1e-8 ? ['lot'] : []),
+  ];
+  const limitedBy = request > changing + 1e-8 ? (capRoom < available ? 'cap' : 'reserve')
+    : limits.includes('lot') ? 'lot' : null;
   const order = { side: shares === 0 ? 'none' : direction > 0 ? 'buy' : 'sell', shares, price: position.price, amount };
   const updated = positions.map((item) => item !== position ? item : {
     ...item, shares: Math.max(0, item.shares + direction * shares), value: Math.max(0, item.value + delta),
@@ -198,71 +253,60 @@ function simulateWeight(positions, histories, benchmarkBars, today, { total, cas
   });
   const snapshot = (items, balance) => {
     const { hhi, effectiveHoldings, largest, cashPercent } = concentrationFor(items, balance, total, cap, reserve);
-    const { pnl } = stressFor(items, total, stress.marketShock, stress.specificSymbol, stress.specificShock, items.length);
+    const { pnl } = stressFor(items, total, stress.marketShock, stress.specificSymbol, stress.specificShock);
     return { cash: balance, cashPercent, weight: items.find((item) => item.symbol === symbol).weight,
       maximumWeight: largest?.weight ?? 0, stressPnl: pnl, hhi, effectiveHoldings };
   };
-  const history = replayHistory(positions, histories, today, total, updated, benchmarkBars);
-  return { ...base, status: 'ready', order, limitedBy: limit, before: snapshot(positions, cash), after: snapshot(updated, nextCash), history };
+  const history = replayHistory(positions, histories, cutoff, total, updated, benchmarkBars);
+  return { ...base, status: 'ready', order, limits, limitedBy, cap, reserve, minimum: quantity?.minimum ?? null,
+    before: snapshot(positions, cash), after: snapshot(updated, nextCash), history };
 }
 
 export function buildRiskLab(summary, histories = {}, {
   cap = 25, maxCashTarget = 20, shock = -20, scenario, simulation, benchmarkBars, now = Date.now(),
 } = {}) {
-  const cash = bounded(summary.cash, 0, Number.MAX_VALUE, 0);
   const capPercent = bounded(cap, 1, 100, 25);
   const reserve = bounded(maxCashTarget, 0, 100, 20);
-  const rows = summary.rows ?? [];
-  const open = rows.filter((row) => finite(row.shares) && row.shares > 0);
-  const valued = open.filter((row) => finite(row.value) && row.value > 0 && row.source !== 'demo');
-  const total = cash + valued.reduce((sum, row) => sum + row.value, 0);
-  const totalPositions = new Set(open.map(({ symbol }) => symbol)).size;
-  const positions = groupPositions(valued, total);
-  const incomplete = Boolean(summary.incomplete || valued.length < open.length);
+  const { total, cash, positions, totalPositions, fullyValuedPositions, incomplete } = portfolioValuation(summary);
   const concentration = concentrationFor(positions, cash, total, capPercent, reserve);
   const marketShock = bounded(shock, -100, 100, -20);
   const specificShock = bounded(scenario?.shock, -100, 100, null);
   const specificSymbol = specificShock !== null && positions.some((item) => item.symbol === scenario.symbol) ? scenario.symbol : '';
-  const stress = stressFor(positions, total, marketShock, specificSymbol, specificSymbol ? specificShock : null, totalPositions);
-  const market = instrumentMarket(positions[0]?.symbol);
-  const today = new Intl.DateTimeFormat('sv-SE', {
-    timeZone: market === 'CN' ? 'Asia/Shanghai' : 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
-  }).format(new Date(now));
-  const trial = simulateWeight(positions, histories, benchmarkBars, today, { total, cash, incomplete },
+  const stress = { ...stressFor(positions, total, marketShock, specificSymbol, specificSymbol ? specificShock : null),
+    totalPositions, fullyValuedPositions, valuedPositions: positions.length,
+    coveragePercent: pct(fullyValuedPositions, totalPositions) };
+  const cutoff = historyCutoff(positions[0]?.symbol, now);
+  const trial = simulateWeight(positions, histories, benchmarkBars, cutoff, { total, cash, incomplete },
     { cap: capPercent, reserve, stress, draft: simulation });
-  const history = !incomplete ? trial.history ?? replayHistory(positions, histories, today, total, null, benchmarkBars) : null;
+  const history = !incomplete ? trial.history ?? replayHistory(positions, histories, cutoff, total, null, benchmarkBars) : null;
   return { status: incomplete ? 'partial' : total > 0 ? 'ready' : 'empty', incomplete, positions, concentration, stress, simulation: trial, history };
 }
 
-export function evaluateAllocation(summary, histories, candidates, { cap = 25, maxCashTarget = 20 } = {}) {
-  if (summary.incomplete || !(summary.total > 0)) return null;
-  const { total, cash, allocation, largest } = summary;
-  const eligible = allocation.filter(({ symbol, value }) => symbol !== 'CASH' && value > 0);
+export function evaluateAllocation(summary, histories, candidates, { cap = 25, maxCashTarget = 20, now = Date.now() } = {}) {
+  const { total, cash, positions: eligible, incomplete } = portfolioValuation(summary);
+  if (incomplete || !(total > 0)) return null;
   if (!eligible.length || eligible.length > 16) return null;
-  const today = new Date().toISOString().slice(0, 10);
+  const largest = eligible[0];
+  const cutoff = historyCutoff(eligible[0].symbol, now);
   const capValue = total * cap / 100;
   const reserve = total * maxCashTarget / 100;
-  const available = Math.max(0, cash - reserve);
-  const trims = largest ? Math.max(0, largest.value - capValue) : 0;
-  const currentMaps = eligible.map(({ symbol }) => dateCloses(histories[symbol], today));
+  const trims = Math.max(0, largest.value - capValue);
+  const currentMaps = eligible.map(({ symbol }) => dateCloses(histories[symbol], cutoff));
   const fresh = candidates.filter((item) => item.market && finite(item.entry) && finite(item.stop) && item.entry > item.stop &&
     ['opportunity', 'watch'].includes(item.status)).sort((a, b) => Number(b.status === 'opportunity') - Number(a.status === 'opportunity'));
   const views = [];
   for (const item of fresh) {
     const current = eligible.find(({ symbol }) => symbol === item.ticker);
-    if (largest?.symbol === item.ticker && trims > 0) continue;
-    const maps = current ? currentMaps : [...currentMaps, dateCloses(histories[item.ticker], today)];
+    if (largest.symbol === item.ticker && trims > 0) continue;
+    const maps = current ? currentMaps : [...currentMaps, dateCloses(histories[item.ticker], cutoff)];
     const days = aligned(maps);
     if (days.length < 41) continue;
-    const headroom = capValue - (current?.value ?? 0);
-    const stopDistance = (item.entry - item.stop) / item.entry;
-    const maxRiskSpend = total * .01 / stopDistance;
-    const planned = Math.min(available + trims, headroom, maxRiskSpend);
-    const lot = item.market === 'CN' ? 100 : 1;
-    const shares = Math.floor(planned / item.entry / lot) * lot;
-    if (shares <= 0) continue;
-    const amount = shares * item.entry;
-    const trimUsed = Math.max(0, amount - available);
+    const plan = tradePlan({ symbol: item.ticker, entry: item.entry, target: item.target, stop: item.stop, riskPercent: 1,
+      cash: cash + trims, equity: total, positionValue: current?.value ?? 0, capPercent: cap, reservePercent: maxCashTarget,
+      fractional: item.market === 'US' });
+    if (!plan.valid || plan.shares <= 0) continue;
+    const { investment: amount, shares } = plan;
+    const trimUsed = Math.min(trims, Math.max(0, amount + reserve - cash));
     const beforeWeights = eligible.map(({ value }) => value / total);
     if (!current) beforeWeights.push(0);
     const afterWeights = [...beforeWeights];
@@ -272,7 +316,7 @@ export function evaluateAllocation(summary, histories, candidates, { cap = 25, m
     const series = maps.map((map) => returns(map, days));
     const before = historicalStats(series, beforeWeights);
     const after = historicalStats(series, afterWeights);
-    views.push({ ticker: item.ticker, from: trimUsed > 0 ? largest.symbol : null,
+    views.push({ ticker: item.ticker, from: trimUsed > 0 ? largest.symbol : null, trimAmount: trimUsed,
       kind: trimUsed > 0 ? '部分替换' : '可用现金增配', amount, shares, nextWeight: afterWeights[addedIndex] * 100,
       beforeVol: before.volatility, afterVol: after.volatility, beforeDrawdown: before.drawdown, afterDrawdown: after.drawdown,
       observations: days.length - 1, entry: item.entry, stop: item.stop, decision: item.status });
@@ -291,10 +335,12 @@ export function recordStrategy(record, analysis, now = Date.now()) {
   const status = analysis.decision?.status ?? 'watch';
   const prior = record.versions?.[0];
   const level = (value) => finite(value) ? value : null;
+  const horizon = analysis.horizons?.find(({ key }) => key === record.horizon);
+  const marketLevels = horizon ?? (analysis.plan?.source === 'manual' ? {} : analysis);
   const next = {
     at: new Date(now).toISOString(), action, status, reason: analysis.decision?.reason ?? analysis.summary,
-    entry: level(analysis.entry), target: level(analysis.target), stop: level(analysis.stop),
-    next: analysis.horizons?.find(({ key }) => key === record.horizon)?.trigger ?? analysis.decision?.reason,
+    entry: level(marketLevels.entry), target: level(marketLevels.target), stop: level(marketLevels.stop),
+    next: horizon?.trigger ?? analysis.decision?.next ?? analysis.decision?.reason,
     assessedOn: analysis.data?.lastBarDate ?? null,
   };
   const sameLevel = (key) => next[key] === prior?.[key] ||
@@ -319,7 +365,10 @@ export function evaluateResearchAlerts(alerts, { analysisFor, quoteFor, strategi
     if (alert.type === 'event') trigger = now >= Date.parse(alert.date);
     else if (alert.type === 'above') trigger = onFeed && quote.price >= alert.price;
     else if (alert.type === 'below') trigger = onFeed && quote.price <= alert.price;
-    else if (alert.type === 'invalidate') trigger = onFeed && quote.price <= alert.price;
+    else if (alert.type === 'invalidate') {
+      const fresh = researchQuoteStatus(quote, instrumentCurrency(alert.symbol), now).quoteStatus === 'fresh';
+      trigger = fresh && quote.price <= alert.price;
+    }
     else if (alert.type === 'opportunity') {
       const versions = strategies[alert.key]?.versions;
       const status = analysisFor(alert.key)?.decision?.status;

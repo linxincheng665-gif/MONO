@@ -9,6 +9,11 @@ const tone = (n) => n > 0 ? 'ws-positive' : n < 0 ? 'ws-negative' : '';
 const valueOrDash = (n, format) => hasNumber(n) ? format(n) : '—';
 const privateValue = (hidden, n, format) => hidden ? '••••' : valueOrDash(n, format);
 const formatRsi = new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const priceFormats = {
+  CNY: new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 6 }),
+  USD: new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 6 }),
+};
+const formatPrice = (value, unit) => valueOrDash(value, (price) => (priceFormats[unit] ?? priceFormats.USD).format(price));
 
 function action(ctx, label, type, { icon, primary = false, data = '', disabled = false } = {}) {
   return `<button type="button" class="button ws-button${primary ? ' primary ws-button-primary' : ''}" data-action="${type}" ${data}${disabled ? ' disabled' : ''}>${icon ? ctx.icons(icon, 15) : ''}${escape(label)}</button>`;
@@ -128,24 +133,46 @@ export function renderDailyIndicators(ctx) {
   return `${metric('MA20', valueOrDash(values.ma20, ctx.money))}${metric('MA50', valueOrDash(values.ma50, ctx.money))}${metric('RSI (14)', valueOrDash(values.rsi ?? values.rsi14, formatRsi.format))}`;
 }
 
+function positionLimitNote(ctx, result) {
+  if (!result?.valid) return result?.error ?? '补齐同币种的持仓估值、现金与计划价位后，可估算仓位。';
+  const labels = { cap: '单标的仓位上限', reserve: '现金储备', cash: '可用现金', amount: '投入上限', risk: '单笔风险预算' };
+  const limit = result.binding.map((key) => labels[key]).join('、');
+  return result.shares > 0 ? `主要约束为${limit}。`
+    : `受${limit}限制，可买数量未达到最低估算单位 ${ctx.number(result.quantity.minimum)}。`;
+}
+
+function positionBudgetDetails(ctx, result) {
+  return [
+    ['新增后标的仓位', valueOrDash(result.postWeight, ctx.percent)],
+    ['新增仓位止损损失占总资产', valueOrDash(result.riskUsedPercent, ctx.percent)],
+    ['风险预算使用', `${ctx.money(result.risk)} / ${ctx.money(result.budget)}`],
+    ['储备后可用现金', ctx.money(result.cashAfterReserve)],
+    ['投入后现金余额', ctx.money(result.remainingCash)],
+    ['单标的新增额度', valueOrDash(result.allocationCapacity, ctx.money)],
+  ];
+}
+
 export function renderTradeResult(ctx) {
   if (ctx.privateAmounts) return '<p class="private-panel">仓位、投入和盈亏测算已隐藏</p>';
   const result = ctx.trade;
-  const ready = result?.valid && hasNumber(result.shares);
-  return `<div class="ws-result-lead"><span>可买入数量</span><strong>${ready ? ctx.number(result.shares) : '—'} <small>股</small></strong>${ready ? '' : `<p>${escape(result?.error || '填写入场、目标及止损价格以计算仓位。')}</p>`}</div>
-    <dl class="ws-result-list"><div><dt>投入金额</dt><dd>${ready ? valueOrDash(result.investment, ctx.money) : '—'}</dd></div><div><dt>盈亏比</dt><dd>${ready && hasNumber(result.ratio) ? `${ctx.number(result.ratio)} : 1` : '—'}</dd></div><div><dt>目标价潜在盈利</dt><dd class="ws-positive">${ready ? valueOrDash(result.reward, ctx.signedMoney) : '—'}</dd></div><div><dt>止损价潜在亏损</dt><dd class="ws-negative">${ready ? valueOrDash(-Math.abs(result.risk), ctx.signedMoney) : '—'}</dd></div></dl>`;
+  const ready = result?.valid;
+  return `<div class="ws-result-lead"><span>预算内买入数量${ctx.tradeDemo ? ' · 演示组合' : ''}</span><strong>${ready ? ctx.number(result.shares) : '—'} <small>股</small></strong>
+    <p>${escape(positionLimitNote(ctx, result))}</p></div>
+    <dl class="ws-result-list"><div><dt>投入金额</dt><dd>${ready ? valueOrDash(result.investment, ctx.money) : '—'}</dd></div><div><dt>情景盈亏比</dt><dd>${ready ? `${result.ratio.toFixed(2)} : 1` : '—'}</dd></div><div><dt>在目标价成交的收益</dt><dd class="ws-positive">${ready ? valueOrDash(result.reward, ctx.signedMoney) : '—'}</dd></div><div><dt>在止损价成交的损失</dt><dd class="ws-negative">${ready ? valueOrDash(result.risk, ctx.money) : '—'}</dd></div></dl>
+    ${ready ? `<details class="ws-analysis-details"><summary>仓位计算依据</summary>${facts(positionBudgetDetails(ctx, result))}
+      <p class="ws-footnote">费用、跳空和滑点会影响实际损失。</p></details>` : ''}`;
 }
 
 function tradesPage(ctx) {
   const { state, tradeInputs = {}, displayedCurrency: unit, privateAmounts } = ctx;
   const form = `<form id="trade-form" class="ws-form">${symbolField('trade-symbol', '交易标的', state, tradeInputs.symbol ?? ctx.symbol)}
     <div class="ws-fields ws-fields-three">${decimalField('trade', 'entry', '入场价', tradeInputs.entry, unit, 'min="0"')}${decimalField('trade', 'target', '目标价', tradeInputs.target, unit, 'min="0"')}${decimalField('trade', 'stop', '止损价', tradeInputs.stop, unit, 'min="0"')}</div>
-    <div class="ws-fields">${decimalField('trade', 'amount', '投入上限', tradeInputs.amount, unit, 'min="0"', privateAmounts)}${decimalField('trade', 'riskPercent', '单笔风险预算', tradeInputs.riskPercent, '%', 'min="0" max="100"')}</div>
-    ${unit === 'USD' ? `<label class="ws-toggle"><input type="checkbox" id="trade-fractional" name="fractional"${tradeInputs.fractional === false ? '' : ' checked'}><span>允许碎股</span></label>` : '<p class="ws-footnote">按整股估算，申报数量以券商和交易所规则为准。</p>'}
+    <div class="ws-fields">${decimalField('trade', 'amount', '投入上限（可选）', tradeInputs.amount, unit, 'min="0"', privateAmounts)}${decimalField('trade', 'riskPercent', '单笔风险预算', tradeInputs.riskPercent, '%', 'min="0" max="100"')}</div>
+    ${unit === 'USD' ? `<label class="ws-toggle"><input type="checkbox" id="trade-fractional" name="fractional"${tradeInputs.fractional === false ? '' : ' checked'}><span>按碎股估算</span></label>` : '<p class="ws-footnote">按标的适用的最小买入数量和递增单位估算。</p>'}
     <div class="ws-cash-context"><span>可用现金</span><strong>${privateValue(privateAmounts, ctx.tradeCash, ctx.money)}</strong></div>
   </form>`;
   const tradeRows = state.trades?.length ? `<div class="ws-table-scroll"><table class="ws-table ws-plan-table" role="table"><thead role="rowgroup"><tr role="row"><th scope="col">标的</th><th scope="col">入场价</th><th scope="col">目标价</th><th scope="col">止损价</th><th scope="col">买入数量</th><th scope="col"><span class="ws-visually-hidden">操作</span></th></tr></thead><tbody role="rowgroup">${state.trades.map(trade => {
-    const planMoney = (value) => ctx.money(value, ctx.instrumentCurrency(trade.symbol));
+    const planMoney = (value) => formatPrice(value, ctx.instrumentCurrency(trade.symbol));
     return `<tr role="row"><th class="ws-plan-identity" scope="row">${escape(trade.symbol)}</th><td role="cell" data-label="入场价">${privateValue(privateAmounts, trade.entry, planMoney)}</td><td role="cell" data-label="目标价">${privateValue(privateAmounts, trade.target, planMoney)}</td><td role="cell" data-label="止损价">${privateValue(privateAmounts, trade.stop, planMoney)}</td><td role="cell" data-label="买入数量">${privateValue(privateAmounts, trade.shares ?? trade.result?.shares, ctx.number)}</td><td role="cell" class="ws-plan-actions">${iconAction(ctx, `删除 ${trade.symbol} 计划`, 'delete-trade', 'trash', `data-id="${escape(trade.id)}"`)}</td></tr>`;
   }).join('')}</tbody></table></div>` : empty('暂无已保存计划。');
   const results = `<div id="trade-results" class="ws-results" aria-live="polite">${renderTradeResult(ctx)}</div><div class="ws-result-actions">${action(ctx, '保存交易计划', 'save-trade', { icon: 'bookmark', primary: true })}</div>`;
@@ -185,7 +212,7 @@ function riskSimulationForm(ctx) {
     <div class="ws-workspace-row"><h2>目标仓位</h2></div>
     <div class="ws-fields">${riskSelect(ctx, 'risk-simulation-symbol', '调整标的', simulation.symbol)}
       ${decimalField('risk-simulation', 'targetWeight', '目标占总资产', simulation.targetWeight ?? ctx.state.riskProfile?.cap ?? 25, '%', 'min="0" max="100" required')}</div>
-    <p class="ws-footnote">增配使用同币种现金，减仓所得回到现金。试算沿用已应用的市场及单一标的情景。</p>
+    <p class="ws-footnote">增配受同币种现金储备和单标的上限约束，减仓所得回到现金。试算沿用已应用的冲击情景。</p>
     <div><button type="submit" class="button ws-button ws-button-primary primary"${ctx.state.holdings.some((item) => item.shares > 0 && item.source !== 'demo') ? '' : ' disabled'}>计算调仓影响</button></div>
   </form>`;
 }
@@ -193,15 +220,20 @@ function riskSimulationForm(ctx) {
 function renderRiskStress(ctx) {
   const s = ctx.riskLab?.stress;
   if (!s || ctx.riskLab.status === 'empty') return empty('添加持仓及估值后查看情景影响。');
+  if (ctx.riskLab.incomplete && !s.valuedPositions) return empty('当前持仓缺少有效估值，补齐后可查看压力测试。');
+  const partial = ctx.riskLab.incomplete;
+  const partialPositions = s.valuedPositions - s.fullyValuedPositions;
+  const showLossShare = s.grossLoss > 0;
   const lossRows = (s.contributions ?? []).slice(0, 12);
-  const contributions = lossRows.length ? `<table class="ws-risk-table ws-risk-contributions"><thead><tr><th scope="col">标的</th><th scope="col">情景涨跌</th><th scope="col">资产变化</th></tr></thead><tbody>
-    ${lossRows.map((item) => `<tr><th scope="row">${escape(item.symbol)}${item.symbol === s.specificSymbol ? '<small>单一情景</small>' : ''}</th><td>${ctx.signedPercent(item.shock)}</td><td class="${tone(item.pnl)}">${ctx.signedMoney(item.pnl)}</td></tr>`).join('')}
+  const contributions = lossRows.length ? `<table class="ws-risk-table ws-risk-contributions"><thead><tr><th scope="col">标的</th><th scope="col">情景涨跌</th><th scope="col">损益</th>${showLossShare ? '<th scope="col">亏损占比</th>' : ''}</tr></thead><tbody>
+    ${lossRows.map((item) => `<tr><th scope="row">${escape(item.symbol)}${item.symbol === s.specificSymbol ? '<small>单一情景</small>' : ''}${item.partial ? '<small>部分有估值</small>' : ''}</th><td>${ctx.signedPercent(item.shock)}</td><td class="${tone(item.pnl)}">${ctx.signedMoney(item.pnl)}</td>${showLossShare ? `<td>${item.lossShare > 0 ? ctx.percent(item.lossShare) : '—'}</td>` : ''}</tr>`).join('')}
   </tbody></table>` : empty('当前币种暂无可估值持仓。');
   return `<div class="ws-risk-results-stack"><div class="ws-workspace-row"><h2>组合受压结果</h2>${s.specificSymbol ? `<span class="ws-section-meta">${escape(s.specificSymbol)} ${ctx.signedPercent(s.specificShock)} · 其余持仓 ${ctx.signedPercent(s.marketShock)}</span>` : ''}</div>
-    <div class="ws-risk-pnl" aria-live="polite"><span>资产变化</span><strong class="${tone(s.pnl)}">${valueOrDash(s.pnl, ctx.signedMoney)}</strong></div>
-    <dl class="ws-risk-pair"><div><dt>组合变动</dt><dd class="${tone(s.changePercent)}">${valueOrDash(s.changePercent, ctx.signedPercent)}</dd></div><div><dt>情景后资产</dt><dd>${valueOrDash(s.totalAfter, ctx.money)}</dd></div></dl>
-    ${ctx.riskLab.incomplete ? `<p class="ws-footnote ws-valuation-note">仅试算有估值的持仓。覆盖 ${s.valuedPositions} / ${s.totalPositions} 个持仓标的。</p>` : ''}
-    <div class="ws-risk-ledger"><div class="ws-workspace-row"><h3>持仓损益贡献</h3>${s.contributions?.length > lossRows.length ? `<span class="ws-section-meta">显示 ${lossRows.length} / ${s.contributions.length}</span>` : ''}</div>${contributions}</div>
+    <div class="ws-risk-pnl" aria-live="polite"><span>${partial ? '已估值部分净损益' : '情景净损益'}</span><strong class="${tone(s.pnl)}">${valueOrDash(s.pnl, ctx.signedMoney)}</strong></div>
+    <dl class="ws-risk-pair"><div><dt>${partial ? '已估值资产变动' : '组合变动'}</dt><dd class="${tone(s.changePercent)}">${valueOrDash(s.changePercent, ctx.signedPercent)}</dd></div><div><dt>${partial ? '情景后已估值资产' : '情景后资产'}</dt><dd>${valueOrDash(s.totalAfter, ctx.money)}</dd></div></dl>
+    ${partial ? `<p class="ws-footnote ws-valuation-note">完整估值 ${s.fullyValuedPositions} / ${s.totalPositions} 个标的${partialPositions > 0 ? `，另有 ${partialPositions} 个标的仅部分持仓有估值` : ''}。</p>` : ''}
+    <div class="ws-risk-ledger"><div class="ws-workspace-row"><h3>持仓损益贡献</h3>${s.contributions?.length > lossRows.length ? `<span class="ws-section-meta">显示 ${lossRows.length} / ${s.contributions.length}</span>` : ''}</div>${contributions}
+    ${showLossShare ? `<p class="ws-footnote">下跌持仓合计亏损 ${ctx.money(s.grossLoss)}，亏损占比按此金额计算。${s.grossGain > 0 ? `上涨持仓合计盈利 ${ctx.money(s.grossGain)}。` : ''}</p>` : ''}</div>
   </div>`;
 }
 
@@ -226,14 +258,21 @@ function renderRiskSimulation(ctx) {
       line('相对基准 β', beta.before, beta.after, (value) => value.toFixed(2)),
     ] : []),
   ];
-  const side = { buy: '增加', sell: '减少', none: '保持' }[order.side];
-  const limitNotice = { reserve: '增配受现金储备约束。', lot: '目标与测算仓位的差异来自可用交易单位。' }[simulation.limitedBy];
-  return `<div class="ws-risk-results-stack"><div class="ws-workspace-row"><h2>调仓前后</h2><span class="ws-section-meta">${escape(simulation.symbol)} · 目标 ${ctx.percent(simulation.targetWeight)}</span></div>
-    <div class="ws-risk-order"><strong>${side} ${ctx.number(order.shares)} 股</strong><span>参考价 ${ctx.money(order.price)} · 变动市值 ${ctx.money(order.amount)}</span></div>
-    ${limitNotice ? `<p class="ws-footnote">${limitNotice}</p>` : ''}
+  const side = order.side === 'none' ? '维持现有仓位' : `${order.side === 'buy' ? '增加' : '减少'} ${ctx.number(order.shares)} 股`;
+  const limits = simulation.limits ?? [];
+  const limitNotices = [
+    ...(limits.includes('cap') ? [`增配须遵守 ${ctx.percent(simulation.cap)} 的单标的上限。`] : []),
+    ...(limits.includes('reserve') ? [`增配后须保留至少 ${ctx.percent(simulation.reserve)} 的现金。`] : []),
+    ...(limits.includes('lot') ? [order.side === 'none' && simulation.minimum ? `可买数量低于起买数量 ${ctx.number(simulation.minimum)} 股。` : '股数已按交易单位向下取整。'] : []),
+    ...(after.weight - simulation.cap > 1e-8 ? [`测算仓位仍高于 ${ctx.percent(simulation.cap)} 的上限。可继续试算减仓。`] : []),
+    ...(simulation.reserve - after.cashPercent > 1e-8 ? [`测算现金占比仍低于 ${ctx.percent(simulation.reserve)} 的储备目标。`] : []),
+  ];
+  return `<div class="ws-risk-results-stack"><div class="ws-workspace-row"><h2>调仓前后</h2><span class="ws-section-meta">${escape(simulation.symbol)} · 目标 ${ctx.percent(simulation.targetWeight)} · 可达 ${ctx.percent(after.weight)}</span></div>
+    <div class="ws-risk-order"><strong>${side}</strong><span>参考价 ${ctx.money(order.price)}${order.shares > 0 ? ` · 变动市值 ${ctx.money(order.amount)}` : ''}</span></div>
+    ${limitNotices.length ? `<p class="ws-footnote">${limitNotices.join(' ')}</p>` : ''}
     <table class="ws-risk-table ws-risk-compare"><thead><tr><th scope="col">指标</th><th scope="col">调整前</th><th scope="col">调整后</th></tr></thead><tbody>
       ${comparison.map(([label, first, last]) => `<tr><th scope="row">${label}</th><td>${escape(first)}</td><td>${escape(last)}</td></tr>`).join('')}</tbody></table>
-    <p class="ws-footnote">${history ? `${escape(history.from)} 至 ${escape(history.through)}，${history.observations} 段共同交易日收益按固定权重回放。` : '共同交易日历史不足，暂缺波动与回撤比较。'}${hasNumber(beta?.before) && hasNumber(beta?.after) ? ` β 使用 ${ctx.portfolioCurrency === 'CNY' ? '沪深 300 ETF' : 'SPY'} 的 ${beta.observations} 段共同交易日收益。` : ''} 股数按估值参考价换算，费用与汇率变动未计入。</p>
+    <p class="ws-footnote">${history ? `${escape(history.from)} 至 ${escape(history.through)}，${history.observations} 段连续的共同日线收益按固定权重回放。` : '至少需要 40 段连续的共同日线收益，才能比较波动与回撤。'}${hasNumber(beta?.before) && hasNumber(beta?.after) ? ` β 使用 ${ctx.portfolioCurrency === 'CNY' ? '沪深 300 ETF' : 'SPY'} 的 ${beta.observations} 段共同日线收益。` : ''} 股数按估值参考价换算，费用与汇率变动未计入。</p>
   </div>`;
 }
 
@@ -246,7 +285,7 @@ function renderRiskDiagnosis(ctx) {
   const { top3, effectiveHoldings, overCap } = concentration;
   return `<div class="ws-grid ws-risk-diagnosis"><section class="ws-risk-results-stack"><div class="ws-workspace-row"><h2>风险集中度</h2></div>
     <dl class="ws-risk-pair"><div><dt>前三持仓占比</dt><dd>${valueOrDash(top3, ctx.percent)}</dd></div><div><dt>等效持仓数</dt><dd>${effectiveHoldings > 0 ? effectiveHoldings.toFixed(1) : '—'}</dd></div></dl>
-    <p class="ws-footnote">等效持仓数按已投资部分的仓位集中程度计算。</p>
+    <p class="ws-footnote">${ctx.riskLab.incomplete ? '当前占比按已有估值与现金计算。' : ''}等效持仓数按已投资部分的仓位集中程度计算。</p>
     ${overCap?.length ? `<p class="ws-risk-limit">超过仓位上限 · ${overCap.map(({ symbol, weight }) => escape(symbol) + ' ' + ctx.percent(weight)).join('、')}</p>` : ''}
     ${bars}</section><section class="ws-risk-results-stack"><div class="ws-workspace-row"><h2>敞口与相关性</h2></div>${renderPortfolioDiagnosis(ctx)}</section></div>`;
 }
@@ -262,9 +301,11 @@ export function renderRiskKpis(ctx) {
   const concentration = ctx.riskLab?.concentration ?? summary;
   const { cashPercent, largest: top } = concentration;
   const drawdown = ctx.riskLab?.history?.before?.drawdown ?? (!ctx.riskLab ? ctx.stress?.drawdown : null);
-  const drawdownLabel = hasNumber(drawdown) ? '按当前仓位回放' : '组合历史不足';
-  return `${metric('最大单一仓位', privateValue(privateAmounts, top?.weight, ctx.percent), privateAmounts ? '' : top ? escape(top.symbol) : '暂无持仓')}
-    ${metric('现金占比', privateValue(privateAmounts, cashPercent, ctx.percent), privateAmounts ? '' : ctx.money(state.cash))}
+  const partial = ctx.riskLab?.incomplete;
+  const drawdownLabel = hasNumber(drawdown) ? '按当前仓位回放' : partial ? '持仓估值待补齐' : '组合历史不足';
+  const coverage = partial ? ' · 按已有估值' : '';
+  return `${metric('最大单一仓位', privateValue(privateAmounts, top?.weight, ctx.percent), privateAmounts ? '' : top ? escape(top.symbol) + coverage : '暂无已估值持仓')}
+    ${metric('现金占比', privateValue(privateAmounts, cashPercent, ctx.percent), privateAmounts ? '' : ctx.money(state.cash) + coverage)}
     ${metric('最大回撤', privateValue(privateAmounts, drawdown, ctx.percent), privateAmounts ? '' : drawdownLabel)}`;
 }
 
@@ -306,19 +347,20 @@ export function renderPortfolioDiagnosis(ctx) {
   if (ctx.privateAmounts) return '<p class="private-panel">组合诊断已隐藏</p>';
   const result = ctx.diagnostics;
   if (!result || result.empty) return empty('需要真实持仓及有效估值才能进行组合诊断。');
-  const { pairs, rebalance, scenario, history } = result;
+  const { pairs, rebalance, scenario, history, usablePairs, possiblePairs } = result;
   const pairRows = pairs.map(({ left, right, coefficient, observations, exposure }) =>
     [left + ' / ' + right, `相关 ${coefficient.toFixed(2)} · ${observations} 期 · 合计 ${ctx.percent(exposure)}`]);
-  const comparison = history ? `<p class="ws-footnote">${escape(history.from)} 至 ${escape(history.through)}，${history.observations} 段共同交易日收益，按当前固定权重重放，现金收益取 0。</p>
+  const comparison = history ? `<p class="ws-footnote">${escape(history.from)} 至 ${escape(history.through)}，${history.observations} 段连续的共同日线收益，按当前固定权重回放，现金收益取 0。</p>
     ${facts([['区间收益', ctx.signedPercent(history.before.periodReturn) + (history.after ? ' → ' + ctx.signedPercent(history.after.periodReturn) : '')],
       ['年化观察波动', ctx.percent(history.before.volatility) + (history.after ? ' → ' + ctx.percent(history.after.volatility) : '')],
-      ['最大回撤', ctx.percent(history.before.drawdown) + (history.after ? ' → ' + ctx.percent(history.after.drawdown) : '')]])}` : empty('同币种持仓共同日线不足，未比较历史风险。');
+      ['最大回撤', ctx.percent(history.before.drawdown) + (history.after ? ' → ' + ctx.percent(history.after.drawdown) : '')]])}` : empty('至少需要 40 段连续的共同日线收益和完整估值，才能比较组合历史风险。');
   return `<p class="ws-analysis-summary">${result.incomplete ? '部分持仓待估值，暂不计算调仓数量及可配置资金。' : rebalance ? `${rebalance.symbol} 超过你设定的单标的上限。可试算降低至 ${ctx.percent(result.cap)} 后的风险。` : '已估值持仓在设定的单标的上限内。'}</p>
     ${facts([['目标储备后可配置现金', valueOrDash(result.deployable, ctx.money)],
       ...(rebalance ? [['降至上限的减仓情景', `${ctx.money(rebalance.value)} · 约 ${ctx.number(rebalance.shares)} 股`]] : [])])}
     <details class="ws-analysis-details"><summary>相关敞口与历史比较</summary>
-      ${pairs.length ? facts(pairRows) : empty('有效样本内暂无相关系数达到 0.75 的持仓对，或共同样本不足。')}
-      <p class="ws-footnote">按共同交易日日收益估计，覆盖最大 ${result.pairedCoverage} 个标的。ETF 成分重叠需查看基金实际披露。</p>${comparison}
+      ${pairs.length ? facts(pairRows) : empty(usablePairs ? '已计算的持仓对中，暂无相关系数达到 0.75。'
+        : possiblePairs ? '持仓对缺少足够的连续共同日线或有效价格变动。' : '至少需要两个已估值标的。')}
+      <p class="ws-footnote">按市值最大的 ${result.pairedCoverage} 个已估值标的检查，已计算 ${usablePairs} / ${possiblePairs} 对。ETF 成分重叠需查看基金实际披露。</p>${comparison}
     </details>
     <details class="ws-analysis-details"><summary>组合情景速查</summary>
       ${facts([[`全部持仓 ${ctx.signedPercent(ctx.shock)}`, ctx.signedMoney(scenario.all) + (rebalance ? ' → ' + ctx.signedMoney(scenario.after) : '')],
@@ -326,7 +368,7 @@ export function renderPortfolioDiagnosis(ctx) {
       ['全部持仓反弹 10%', ctx.signedMoney(scenario.recovery) + (rebalance ? ' → ' + ctx.signedMoney(scenario.recoveryAfter) : '')]])}</details>
     ${ctx.alternative ? `<section class="ws-analysis-details"><h3>${escape(ctx.alternative.kind)} · ${escape(ctx.alternative.ticker)}</h3>
       <p class="ws-footnote">待入场条件满足后复核。比较使用 ${ctx.alternative.observations} 段共同交易日及 1% 单笔风险预算。
-      ${ctx.alternative.from ? '需要先从 ' + escape(ctx.alternative.from) + ' 释放资金。' : ''}</p>
+      ${ctx.alternative.from ? '需要从 ' + escape(ctx.alternative.from) + ' 释放 ' + ctx.money(ctx.alternative.trimAmount) + '，以满足投入和储备要求。' : ''}</p>
       ${facts([['新增资金与数量', ctx.money(ctx.alternative.amount) + ' · ' + ctx.number(ctx.alternative.shares) + ' 股'],
         ['增配后仓位', ctx.percent(ctx.alternative.nextWeight)], ['年化波动', ctx.percent(ctx.alternative.beforeVol) + ' → ' + ctx.percent(ctx.alternative.afterVol)],
         ['历史回撤', ctx.percent(ctx.alternative.beforeDrawdown) + ' → ' + ctx.percent(ctx.alternative.afterDrawdown)]])}</section>`
@@ -396,13 +438,13 @@ function renderTracking(ctx) {
     ${ctx.journal.versions.length > 1 ? `<details class="ws-analysis-details"><summary>策略历史 · ${ctx.journal.versions.length} 版</summary>${ctx.journal.versions.slice(1).map((version) =>
       `<p>${escape(readableDate(version.at))} · ${escape(version.action)} · ${escape(version.reason)}${!ctx.privateAmounts && hasNumber(version.entry) ? ` · 入场 ${ctx.money(version.entry)} / 失效 ${ctx.money(version.stop)}` : ''}</p>`).join('')}</details>` : ''}
     </div>` : '';
-  const alerts = (ctx.alerts ?? []).map((alert) => `<li><span><b>${escape(localAlertLabels[alert.type])}${!ctx.privateAmounts && hasNumber(alert.price) ? ' · ' + ctx.money(alert.price) : ''}</b>
+  const alerts = (ctx.alerts ?? []).map((alert) => `<li><span><b>${escape(localAlertLabels[alert.type])}${!ctx.privateAmounts && hasNumber(alert.price) ? ' · ' + formatPrice(alert.price, ctx.displayedCurrency) : ''}</b>
     <span>${alert.firedAt ? '已触发 · ' + escape(readableDate(alert.firedAt)) : alert.date ? escape(readableDate(alert.date)) : '等待条件'}</span></span>
     ${iconAction(ctx, '移除提醒', 'remove-research-alert', 'trash', `data-id="${escape(alert.id)}"`)}</li>`).join('');
   return `<div class="ws-grid ws-research-tracking"><section class="ws-research-section"><div class="ws-workspace-row"><h2>策略跟踪</h2>${action(ctx, tracking ? '暂停跟踪' : '跟踪当前策略', 'track-strategy', { icon: 'bookmark' })}</div>${log || empty('跟踪后可查看判断变化与最近触发条件。')}</section>
     <section class="ws-research-section"><div class="ws-workspace-row"><h2>条件提醒</h2>${action(ctx, '新建提醒', 'add-research-alert', { icon: 'plus', primary: true })}</div>
     ${alerts ? `<ul class="ws-rule-list">${alerts}</ul>` : empty('暂无提醒。')}
-    <p class="ws-footnote ws-monitor-note">在应用打开并收到数据时检查。已触发的提醒保存在本机。</p></section></div>`;
+    <p class="ws-footnote ws-monitor-note">应用打开时检查提醒。策略失效和机会触发使用近 5 分钟内的可核验报价。</p></section></div>`;
 }
 
 function renderResearchSizing(ctx) {
@@ -411,12 +453,13 @@ function renderResearchSizing(ctx) {
   const levels = plan?.levels;
   return `<details class="ws-analysis-details"><summary>仓位与退出情景</summary>
     ${levels ? `<p class="ws-footnote">${escape(levels.basis)}${levels.supportDate ? ' · 支撑 ' + escape(levels.supportDate) : ''}${levels.resistanceDate ? ' · 阻力 ' + escape(levels.resistanceDate) : ''}${levelSource === 'manual' ? ' · 用户输入' : ''}</p>` : ''}
-    ${ctx.privateAmounts ? '<p class="private-panel">仓位与金额已隐藏</p>' : size?.valid && size.shares > 0 ? facts([
-      ['预算内投入', ctx.money(size.investment)], ['数量', ctx.number(size.shares) + ' 股'],
-      ['新增后仓位', valueOrDash(size.postWeight, ctx.percent)], ['到失效价的情景损失', ctx.money(size.risk)],
-      ['到目标价的情景收益', ctx.money(size.reward)],
-    ]) : empty(size?.note ?? size?.error ?? '可用资金、有效价位与风险预算齐备后才能估算仓位。')}
-    ${size?.valid && size.note ? `<p class="ws-footnote">${escape(size.note)}</p>` : ''}
+    ${ctx.privateAmounts ? '<p class="private-panel">仓位与金额已隐藏</p>' : size?.valid ? `${facts([
+      [size.demo ? '预算内投入（演示组合）' : '预算内投入', ctx.money(size.investment)], ['数量', ctx.number(size.shares) + ' 股'],
+      ['在失效价成交的损失', ctx.money(size.risk)], ['在目标价成交的收益', ctx.money(size.reward)],
+      ...positionBudgetDetails(ctx, size),
+    ])}<p class="ws-footnote">${escape(positionLimitNote(ctx, size))}以入场区间上沿测算，费用、跳空和滑点会影响实际损失。</p>`
+      : empty(ctx.strategy.decision?.status === 'invalidated' && plan?.source !== 'manual'
+        ? '该行情观察计划已失效。' : positionLimitNote(ctx, size))}
     ${ctx.strategy.scenarios?.length ? `<ul class="ws-rule-list">${ctx.strategy.scenarios.map((item) => `<li><span><b>${escape(item.label)} · ${escape(item.action)}</b><span>${escape(item.condition)}</span></span></li>`).join('')}</ul>` : ''}
   </details>`;
 }
@@ -437,20 +480,26 @@ function renderResearchOverview(ctx) {
   const leadNews = ctx.newsContext?.[0];
   const size = strategy.plan?.size;
   const manual = strategy.plan?.source === 'manual';
-  const levels = [[manual ? '手填入场' : '入场区间', zone && zone.low !== zone.high ? `${ctx.money(zone.low)} – ${ctx.money(zone.high)}` : valueOrDash(entry, ctx.money)],
-    [manual ? '手填目标' : '目标情景', valueOrDash(target, ctx.money)], [manual ? '手填失效' : '失效价', valueOrDash(stop, ctx.money)]];
-  const blocked = decision?.status === 'blocked';
+  const price = (value) => formatPrice(value, strategy.currency);
+  const levels = [[manual ? '手填入场' : '入场区间', zone && zone.low !== zone.high ? `${price(zone.low)} – ${price(zone.high)}` : price(entry)],
+    [manual ? '手填目标' : '目标情景', price(target)], [manual ? '手填失效' : '失效价', price(stop)]];
   const transferIsPrimary = strategy.canTransfer && (!manual || decision?.status === 'opportunity');
+  const nextView = decision?.nextView ?? 'basis';
+  const nextLabel = { evidence: '查看数据', basis: '查看依据', tracking: '查看跟踪' }[nextView];
   const button = transferIsPrimary
     ? action(ctx, manual ? '带入手填情景' : '带入交易工作台', 'use-strategy', { icon: 'arrow-up-right', primary: true })
-    : action(ctx, blocked ? '查看数据' : '编辑假设', 'research-tab', { icon: blocked ? 'activity' : 'edit', data: `data-research-tab="${blocked ? 'evidence' : 'basis'}"` });
-  const briefSize = size?.valid && size.shares > 0 && !ctx.privateAmounts ? `预算内 ${ctx.number(size.shares)} 股 · ${ctx.money(size.investment)}` : '';
+    : action(ctx, nextLabel, 'research-tab', { icon: nextView === 'tracking' ? 'bookmark' : 'activity', data: `data-research-tab="${nextView}"` });
+  const briefSize = size?.valid && !ctx.privateAmounts ? size.shares > 0
+    ? `${size.demo ? '演示 · ' : ''}预算内 ${ctx.number(size.shares)} 股 · ${ctx.money(size.investment)}`
+    : positionLimitNote(ctx, size) : '';
   const transferManual = manual && strategy.canTransfer && !transferIsPrimary;
-  return `<section class="ws-research-thesis" data-status="${escape(decision?.status)}"><div class="ws-research-thesis-copy"><p>普通决策${horizon?.label ? ' · ' + escape(horizon.label) : ''}</p><h2>${escape(decision?.action ?? '继续观察')}</h2><p>${escape(decision?.reason ?? strategy.summary)}</p></div><div class="ws-actions">${button}</div></section>
+  const quoteSummary = hasNumber(ctx.quote?.price) ? `${escape(price(ctx.quote.price))} · ${quoteSourceLink(ctx.quote, ctx.symbol)} ${quoteDate(ctx.quote)}` : '';
+  return `<section class="ws-research-thesis" data-status="${escape(decision?.status)}"><div class="ws-research-thesis-copy"><p>${escape(horizon?.label ?? '')}判断</p><h2>${escape(decision?.action ?? '继续观察')}</h2><p>${escape(decision?.reason ?? strategy.summary)}</p></div><div class="ws-actions">${button}</div></section>
     ${strategy.manualScenario?.valid === false ? `<p class="ws-footnote ws-research-input-note">${escape(strategy.manualScenario.reason)}</p>` : ''}
     <dl class="ws-research-levels">${levels.map(([label, value]) => `<div><dt>${label}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>
+    ${quoteSummary ? `<p class="ws-footnote">${quoteSummary}</p>` : ''}
     ${(hasNumber(ratio) || briefSize || transferManual) ? `<div class="ws-workspace-row ws-brief-size"><span>${hasNumber(ratio) ? `情景盈亏比 ${ratio.toFixed(2)} : 1` : ''}${briefSize ? `${hasNumber(ratio) ? ' · ' : ''}${escape(briefSize)}` : ''}</span>${transferManual ? `<button type="button" class="link-button" data-action="use-strategy">带入手填情景 ${ctx.icons('arrow', 13)}</button>` : ''}</div>` : ''}
-    ${horizon?.trigger ? `<p class="ws-research-trigger"><strong>下一触发</strong><span>${escape(horizon.trigger)}</span></p>` : ''}
+    ${decision?.next ? `<p class="ws-research-trigger"><strong>下一步</strong><span>${escape(decision.next)}</span></p>` : ''}
     <div class="ws-research-signals">${event?.detail || leadNews ? `<div><span>近期事件</span>${event?.detail ? `<p>${escape(event.detail)}</p>` : ''}${leadNews ? `<p>${sourceLink(leadNews.url, leadNews.label)} <small class="ws-footnote">${escape(readableDate(leadNews.publishedAt ?? leadNews.asOf))}</small></p>` : ''}</div>` : ''}${horizon?.invalidation ? `<div><span>${manual ? '行情失效条件' : '主要风险'}</span><p>${escape(horizon.invalidation)}</p></div>` : ''}</div>
     <div class="ws-research-deep">${renderResearchSizing(ctx)}
     ${(horizons ?? []).length ? `<details class="ws-analysis-details"><summary>各周期判断</summary><ul class="ws-rule-list">${horizons.map((item) => `<li><span><b>${escape(item.label)} · ${escape(item.action)}</b><span>${escape(item.trigger)}</span><span>${escape(item.invalidation)}</span></span></li>`).join('')}</ul></details>` : ''}</div>`;
@@ -509,15 +558,33 @@ function renderQuantAnalysis(ctx) {
 function renderQuantValidation(ctx) {
   const report = ctx.quant?.validation;
   if (!report) return empty('等待策略参数与历史日线。');
-  const summary = (test) => test ? facts([['交易次数', test.trades], ['净收益', valueOrDash(test.totalReturn, ctx.signedPercent)], ['最大回撤', valueOrDash(test.maxDrawdown, ctx.percent)], ['胜率', valueOrDash(test.winRate, ctx.percent)]]) : empty('样本不足。');
-  const { sample, coverage, audit, selection, checks = [], tradeSamples = [], assumptions = [] } = report;
+  const { sample, coverage, audit, selection, settings, evidence, train, holdout,
+    checks = [], tradeSamples = [], assumptions = [] } = report;
+  const summary = (test) => {
+    const rows = [
+      ['净收益', valueOrDash(test.totalReturn, ctx.signedPercent), valueOrDash(test.baseline.totalReturn, ctx.signedPercent)],
+      ['最大回撤', valueOrDash(test.maxDrawdown, ctx.percent), valueOrDash(test.baseline.maxDrawdown, ctx.percent)],
+      ['持仓占比', ctx.percent(test.exposure), '100%'],
+      ['完成交易', `${test.trades} 笔`, '1 笔'],
+      ['胜率', valueOrDash(test.winRate, ctx.percent), '—'],
+    ];
+    return `<div class="ws-table-scroll"><table class="ws-table"><thead><tr><th scope="col">指标</th><th scope="col">突破规则</th><th scope="col">同标的买入持有</th></tr></thead><tbody>${rows.map(([metric, rule, baseline]) => `<tr><th scope="row">${escape(metric)}</th><td>${escape(rule)}</td><td>${escape(baseline)}</td></tr>`).join('')}</tbody></table></div>`;
+  };
+  const actualRule = settings && `MA${settings.fast} / MA${settings.slow} · 突破 ${settings.breakout} 日 · 持有 ${settings.holding} 日 · 单边 ${settings.costBps} bp`;
   return `<div class="ws-workspace-row"><div><p class="ws-source-tag">MONO · 本机计算</p><h2>样本外验证</h2></div></div>
-    ${report.reason ? `<p class="ws-footnote">${escape(report.reason)}</p>` : ''}
-    ${sample ? `<p class="ws-footnote">前段 ${sample.training} 根 · 留出 ${sample.holdout} 根${sample.holdoutStart ? ` · ${escape(sample.holdoutStart)} 至 ${escape(sample.holdoutEnd)}` : ''}</p><div class="ws-grid ws-quant-pair"><section><h3>前段样本</h3>${summary(report.train)}</section><section><h3>留出样本</h3>${summary(report.holdout)}</section></div>` : ''}
+    ${report.reason ? `<p class="ws-footnote">${escape(report.reason)}</p>` : `<p class="ws-footnote">${selection?.mode === 'training-selection' ? '前段筛选后的规则' : '使用规则'} · ${escape(actualRule)}</p>`}
+    ${sample && holdout ? `<section class="ws-quant-section"><h3>留出样本</h3><p class="ws-footnote">${escape(sample.holdoutStart)} 至 ${escape(sample.holdoutEnd)} · ${sample.holdout} 根日线</p>
+      <p class="ws-footnote">${escape(evidence?.detail)}</p>${summary(holdout)}
+      ${hasNumber(holdout.excessReturn) ? `<p class="ws-footnote">规则净收益较买入持有 ${holdout.excessReturn >= 0 ? '+' : ''}${holdout.excessReturn.toFixed(2)} 个百分点。</p>` : ''}
+      <p class="ws-footnote">两者使用同一价格序列和单边成本。买入持有从区间首日开盘持有到末日开盘。收益按输入价格计算。</p></section>` : ''}
+    ${sample && train ? `<details class="ws-analysis-details"><summary>前段样本 · ${sample.training} 根</summary><p class="ws-footnote">${escape(sample.trainingStart)} 至 ${escape(sample.trainingEnd)}</p>${summary(train)}</details>` : ''}
     <section class="ws-quant-section"><h3>样本与复算核对</h3>${coverage ? facts([['完整日线 / OHLC', `${coverage.completedRows ?? 0} 根 / ${coverage.ohlcRows ?? 0} 根`], ['成交复算', audit ? `${audit.passed} / ${audit.checked} 笔` : '—'], ['样本校验标识', coverage.fingerprint ?? '—']]) : ''}
     ${checks.length ? `<ul class="ws-rule-list">${checks.map(({ label, status, detail }) => `<li><span><b>${escape(label)}</b><span>${escape(detail)}</span></span><small data-status="${escape(status)}">${({ pass: '通过', watch: '需复核', pending: '待核验', fail: '未通过' })[status] ?? '待核验'}</small></li>`).join('')}</ul>` : ''}</section>
-    ${selection?.reason ? `<details class="ws-analysis-details"><summary>参数筛选${selection.candidates?.length ? ' · ' + selection.candidates.length + ' 组' : ''}</summary><p class="ws-footnote">${escape(selection.reason)}</p>${selection.candidates?.length ? `<ul class="ws-rule-list">${selection.candidates.map((item) => `<li><span><b>${escape([item.rule?.fast, item.rule?.slow, item.rule?.breakout, item.rule?.holding].filter(hasNumber).join(' / '))}</b><span>${item.trades} 笔 · ${valueOrDash(item.totalReturn, ctx.signedPercent)} · 回撤 ${valueOrDash(item.maxDrawdown, ctx.percent)}</span></span><small>${item.eligible ? '满足筛选条件' : '样本或校验不足'}</small></li>`).join('')}</ul>` : ''}</details>` : ''}
-    ${tradeSamples.length ? `<details class="ws-analysis-details"><summary>逐笔样本 · ${tradeSamples.length} 笔</summary><ul class="ws-rule-list">${tradeSamples.map((item) => `<li><span><b>${item.segment === 'holdout' ? '留出' : '前段'} · ${escape(item.signalDate)} 信号</b><span>${escape(item.entryDate)} 开盘 ${valueOrDash(item.entryOpen, ctx.money)} → ${escape(item.exitDate)} 开盘 ${valueOrDash(item.exitOpen, ctx.money)} · ${valueOrDash(item.returnPercent, ctx.signedPercent)}</span></span><small data-status="${item.reproduced && item.chronological ? 'pass' : 'watch'}">${item.reproduced && item.chronological ? '已复算' : '需复核'}</small></li>`).join('')}</ul></details>` : ''}
+    ${selection?.reason ? `<details class="ws-analysis-details"><summary>参数筛选${selection.candidates?.length ? ' · ' + selection.candidates.length + ' 组' : ''}</summary><p class="ws-footnote">${escape(selection.reason)}</p>${selection.candidates?.length ? `<ul class="ws-rule-list">${selection.candidates.map((item) => `<li><span><b>${escape([item.rule?.fast, item.rule?.slow, item.rule?.breakout, item.rule?.holding].filter(hasNumber).join(' / '))}</b><span>${item.trades} 笔 · ${valueOrDash(item.totalReturn, ctx.signedPercent)} · 回撤 ${valueOrDash(item.maxDrawdown, ctx.percent)}</span></span><small>${item.selected ? (item.eligible ? '采用' : '沿用预设') : item.eligible ? '满足筛选条件' : '样本或校验不足'}</small></li>`).join('')}</ul>` : ''}</details>` : ''}
+    ${tradeSamples.length ? `<details class="ws-analysis-details"><summary>逐笔样本 · ${tradeSamples.length} 笔</summary><ul class="ws-rule-list">${tradeSamples.map((item) => {
+      const valid = item.reproduced && item.chronological && item.signalValidated;
+      return `<li><span><b>${item.segment === 'holdout' ? '留出' : '前段'} · ${escape(item.signalDate)} 信号</b><span>${escape(item.entryDate)} 开盘 ${valueOrDash(item.entryOpen, ctx.money)} → ${escape(item.exitDate)} 开盘 ${valueOrDash(item.exitOpen, ctx.money)} · ${valueOrDash(item.returnPercent, ctx.signedPercent)}</span></span><small data-status="${valid ? 'pass' : 'watch'}">${valid ? '已复算' : '需复核'}</small></li>`;
+    }).join('')}</ul></details>` : ''}
     ${assumptions.length ? `<details class="ws-analysis-details"><summary>成交与成本假设</summary><ul class="ws-plain-list">${assumptions.map((note) => `<li>${escape(note)}</li>`).join('')}</ul></details>` : ''}`;
 }
 
@@ -553,9 +620,9 @@ const scopeLabels = { catalog: '内置市场名单', watch: '自选与持仓', c
 
 function opportunityRow(ctx, item) {
   const unit = ctx.instrumentCurrency(item.ticker);
-  const money = (value) => ctx.money(value, unit);
-  const prices = [['入场', item.entry], ['目标', item.target], ['失效', item.stop]].filter(([, value]) => hasNumber(value)).map(([label, value]) => [label, money(value)]);
-  if (prices[0]?.[0] === '入场' && hasNumber(item.zone?.low) && hasNumber(item.zone?.high) && item.zone.low !== item.zone.high) prices[0] = ['入场区间', `${money(item.zone.low)} – ${money(item.zone.high)}`];
+  const price = (value) => formatPrice(value, unit);
+  const prices = [['入场', item.entry], ['目标', item.target], ['失效', item.stop]].filter(([, value]) => hasNumber(value)).map(([label, value]) => [label, price(value)]);
+  if (prices[0]?.[0] === '入场' && hasNumber(item.zone?.low) && hasNumber(item.zone?.high) && item.zone.low !== item.zone.high) prices[0] = ['入场区间', `${price(item.zone.low)} – ${price(item.zone.high)}`];
   return `<li class="ws-opportunity-row"><header><div><strong>${escape(item.ticker)}</strong>${item.name && item.name !== item.ticker ? `<span>${escape(item.name)}</span>` : ''}</div>${action(ctx, '查看研究', 'open-research-symbol', { icon: 'arrow-up-right', data: `data-symbol="${escape(item.ticker)}"` })}</header>
     <p class="ws-opportunity-reason"><b>${escape(item.action)}</b><span>${escape(item.reason)}</span></p>
     ${prices.length ? `<dl class="ws-opportunity-prices">${prices.map(([label, value]) => `<div><dt>${label}</dt><dd>${escape(value)}</dd></div>`).join('')}</dl>` : ''}

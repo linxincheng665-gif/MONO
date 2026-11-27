@@ -1,4 +1,4 @@
-import { instrumentCurrency, normalizeTicker } from './instruments.mjs';
+import { buyQuantityRules, instrumentCurrency, normalizeTicker } from './instruments.mjs';
 
 const storageKey = "mono-investment-workspace-v2";
 
@@ -354,33 +354,60 @@ function roundShares(limit, precision) {
   return Math.floor(units + Math.min(1e-7, Number.EPSILON * Math.abs(units) * 2)) / precision;
 }
 
-export function tradePlan({ entry, target, stop, amount, riskPercent, cash, equity, fractional }) {
+export function tradePlan({
+  symbol, entry, target, stop, amount, riskPercent, cash, equity, fractional, incomplete,
+  positionValue, capPercent, reservePercent, lotSize,
+}) {
   const entryPrice = positive(entry);
   const targetPrice = positive(target);
   const stopPrice = positive(stop);
-  const requestedAmount = positive(amount);
-  const requestedRisk = positive(riskPercent);
+  const amountEntered = amount != null && String(amount).trim() !== "";
+  const requestedAmount = nonnegative(amount);
+  const requestedRisk = nonnegative(riskPercent);
   const availableCash = nonnegative(cash);
-  const portfolioEquity = nonnegative(equity);
-  if ([entryPrice, targetPrice, stopPrice, requestedAmount, requestedRisk, availableCash, portfolioEquity].includes(null)) {
-    return { valid: false, error: "请输入有效的价格、投入金额和风险预算。" };
+  const portfolioEquity = positive(equity);
+  if ([entryPrice, targetPrice, stopPrice, requestedRisk].includes(null) || (amountEntered && requestedAmount === null)) {
+    return { valid: false, error: "请填写有效的价位与单笔风险预算。投入上限可留空。" };
   }
   if (stopPrice >= entryPrice || targetPrice <= entryPrice) {
     return { valid: false, error: "做多计划须满足止损价 < 入场价 < 目标价。" };
   }
   if (requestedRisk > 100) return { valid: false, error: "风险预算必须在 0% 与 100% 之间。" };
+  if (incomplete || availableCash === null || portfolioEquity === null) {
+    return { valid: false, error: "补齐同币种持仓估值和现金后，即可计算仓位。" };
+  }
+  const heldValue = nonnegative(positionValue);
+  const cap = nonnegative(capPercent);
+  const reserve = nonnegative(reservePercent);
+  if ((capPercent != null && (cap === null || cap > 100 || heldValue === null))
+    || (reservePercent != null && (reserve === null || reserve > 100))) {
+    return { valid: false, error: "核对当前持仓、单标的上限与现金储备比例。" };
+  }
 
   const riskPerShare = entryPrice - stopPrice;
   const rewardPerShare = targetPrice - entryPrice;
   const budget = portfolioEquity * (requestedRisk / 100);
-  const cashLimit = Math.min(requestedAmount, availableCash) / entryPrice;
+  const cashReserved = portfolioEquity * ((reserve ?? 0) / 100);
+  const cashAfterReserve = Math.max(0, availableCash - cashReserved);
+  const allocationCapacity = cap === null ? null : Math.max(0, portfolioEquity * (cap / 100) - heldValue);
+  const cashLimit = Math.min(requestedAmount ?? Infinity, cashAfterReserve) / entryPrice;
   const riskLimit = budget / riskPerShare;
-  const shareLimit = Math.min(cashLimit, riskLimit);
+  const limits = [
+    ["cap", allocationCapacity === null ? Infinity : allocationCapacity / entryPrice],
+    [cashReserved > 0 ? "reserve" : "cash", cashAfterReserve / entryPrice],
+    ["amount", requestedAmount === null ? Infinity : requestedAmount / entryPrice],
+    ["risk", riskLimit],
+  ];
+  const shareLimit = Math.min(...limits.map(([, limit]) => limit));
   const ratio = rewardPerShare / riskPerShare;
   if (!Number.isFinite(shareLimit) || !Number.isFinite(ratio)) {
     return { valid: false, error: "输入超出可计算范围。" };
   }
-  const shares = roundShares(shareLimit, fractional ? 1e4 : 1);
+  const quantity = Number.isInteger(lotSize) && lotSize > 0 ? { minimum: lotSize, increment: lotSize }
+    : buyQuantityRules(symbol, fractional);
+  const rounded = quantity.increment < 1 ? roundShares(shareLimit, 1 / quantity.increment)
+    : roundShares(shareLimit / quantity.increment, 1) * quantity.increment;
+  const shares = rounded >= quantity.minimum ? rounded : 0;
   const investment = shares * entryPrice;
   const risk = shares * riskPerShare;
   const reward = shares * rewardPerShare;
@@ -400,6 +427,14 @@ export function tradePlan({ entry, target, stop, amount, riskPercent, cash, equi
     rewardPerShare,
     cashLimit,
     riskLimit,
+    quantity,
+    binding: limits.filter(([, limit]) => limit === shareLimit).map(([key]) => key),
+    cashReserved,
+    cashAfterReserve,
+    allocationCapacity,
+    remainingCash: Math.max(0, availableCash - investment),
+    postWeight: heldValue === null ? null : (heldValue + investment) / portfolioEquity * 100,
+    riskUsedPercent: risk / portfolioEquity * 100,
   };
 }
 
