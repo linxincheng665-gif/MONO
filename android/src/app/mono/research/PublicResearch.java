@@ -8,11 +8,16 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URI;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Semaphore;
+import java.util.regex.Pattern;
 
 final class PublicResearch {
     private static final int MAX_BYTES = 12_000_000;
+    private static final int MAX_QUOTE_BYTES = 64 * 1024;
+    private static final String SINA_SYMBOL = "gb_[a-z][a-z0-9]{0,14}(?:\\$[a-z0-9]{1,4})?";
+    private static final Pattern SINA_QUOTE_URL = Pattern.compile("https://hq\\.sinajs\\.cn/list=" + SINA_SYMBOL + "(?:," + SINA_SYMBOL + "){0,29}");
     private static final Semaphore SLOTS = new Semaphore(6);
     private static long nextSecRequest;
 
@@ -42,6 +47,8 @@ final class PublicResearch {
                 return "/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy".equals(path) && query.isEmpty();
             case "feeds.finance.yahoo.com":
                 return "/rss/2.0/headline".equals(path) && query.matches("s=[A-Z][A-Z0-9.-]{0,13}&region=US&lang=en-US");
+            case "hq.sinajs.cn":
+                return SINA_QUOTE_URL.matcher(uri.toString()).matches();
             case "news.google.com":
                 return "/rss/search".equals(path) && query.matches("q=\"[\\p{L}\\p{N} .·（）()\\-]{1,100}\"&hl=zh-CN&gl=CN&ceid=CN:zh-Hans");
             default: return false;
@@ -66,6 +73,12 @@ final class PublicResearch {
         try { uri = raw == null || raw.length() > 1100 ? null : URI.create(raw); }
         catch (IllegalArgumentException error) { return response(400, empty, headers); }
         if (uri == null || !allowed(uri)) return response(403, empty, headers);
+        boolean sinaQuote = "hq.sinajs.cn".equals(uri.getHost());
+        int maxBytes = sinaQuote ? MAX_QUOTE_BYTES : MAX_BYTES;
+        if (sinaQuote) {
+            headers = new HashMap<>(headers);
+            headers.put("Cache-Control", "no-store");
+        }
         if (!SLOTS.tryAcquire()) return response(429, empty, headers);
         HttpURLConnection connection = null;
         try {
@@ -77,14 +90,18 @@ final class PublicResearch {
             connection.setRequestProperty("User-Agent", "MONO Public Research/3.2");
             if ("query.sse.com.cn".equals(uri.getHost())) connection.setRequestProperty("Referer", "https://www.sse.com.cn/");
             if ("api.fund.eastmoney.com".equals(uri.getHost())) connection.setRequestProperty("Referer", "https://fundf10.eastmoney.com/");
+            if (sinaQuote) {
+                connection.setUseCaches(false);
+                connection.setRequestProperty("Referer", "https://finance.sina.com.cn/");
+            }
             int status = connection.getResponseCode();
             if (status < 200 || status >= 300) return response(status >= 400 && status < 600 ? status : 502, empty, headers);
-            if (connection.getContentLength() > MAX_BYTES) return response(502, empty, headers);
+            if (connection.getContentLength() > maxBytes) return response(502, empty, headers);
             try (InputStream input = connection.getInputStream(); ByteArrayOutputStream bytes = new ByteArrayOutputStream()) {
                 byte[] chunk = new byte[8192];
                 int count;
                 while ((count = input.read(chunk)) != -1) {
-                    if (bytes.size() + count > MAX_BYTES) return response(502, empty, headers);
+                    if (bytes.size() + count > maxBytes) return response(502, empty, headers);
                     bytes.write(chunk, 0, count);
                 }
                 return response(200, bytes.toByteArray(), headers);

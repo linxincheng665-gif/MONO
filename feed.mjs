@@ -1,4 +1,4 @@
-import { normalizeTicker } from './instruments.mjs';
+import { instrumentMarket, normalizeTicker } from './instruments.mjs';
 
 export function validateFeed(value) {
   if (!value.url?.trim()) return null;
@@ -20,11 +20,28 @@ function parseQuotes(payload, symbols) {
     const price = Number(row?.price);
     const timestamp = row?.timestamp ?? row?.date;
     const numericDate = typeof timestamp === 'number' ? (Math.abs(timestamp) < 1e11 ? timestamp * 1000 : timestamp) : null;
-    const time = numericDate !== null || (typeof timestamp === 'string' && /T\d\d:/i.test(timestamp)) ? new Date(numericDate ?? timestamp).getTime() : NaN;
+    const zoned = typeof timestamp === 'string' && /T\d\d:.*(?:Z|[+-]\d{2}:?\d{2})$/i.test(timestamp);
+    const time = numericDate !== null || zoned ? new Date(numericDate ?? timestamp).getTime() : NaN;
     if (!symbols.includes(symbol) || !Number.isFinite(price) || price <= 0 || !Number.isFinite(time)) return [];
     const change = row?.change;
     const currency = typeof row.currency === 'string' ? row.currency.toUpperCase().trim() : undefined;
-    return [{ symbol, price, change: change != null && Number.isFinite(Number(change)) ? Number(change) : null, date: new Date(time).toISOString(), currency, source: 'live' }];
+    const date = new Date(time).toISOString();
+    const suppliedSession = row?.session;
+    let session = null;
+    if (instrumentMarket(symbol) === 'US') {
+      if (suppliedSession != null && !['regular', 'pre', 'post', 'overnight'].includes(suppliedSession)) return [];
+      if (suppliedSession == null) {
+        const minute = easternTradeMinute(date);
+        if (minute >= 4 * 60 && minute < 9 * 60 + 30) session = 'pre';
+        else if (minute > 16 * 60 && minute <= 20 * 60) session = 'post';
+        else if (minute < 4 * 60 || minute > 20 * 60) return [];
+      } else if (suppliedSession !== 'regular') session = suppliedSession;
+    } else if (suppliedSession != null && suppliedSession !== 'regular') return [];
+    const referenceClose = session && Number(row.referenceClose) > 0 ? positiveNumber(Number(row.referenceClose)) : null;
+    const normalizedChange = session ? referenceClose === null ? null : (price / referenceClose - 1) * 100
+      : change != null && Number.isFinite(Number(change)) ? Number(change) : null;
+    return [{ symbol, price, change: normalizedChange, date, currency, source: 'live',
+      ...(session ? { session, referenceClose } : {}) }];
   });
 }
 
@@ -166,10 +183,31 @@ function positiveNumber(value) {
   return Number.isFinite(value) && value > 0 ? value : null;
 }
 
+const easternTradeClock = new Intl.DateTimeFormat('en-US', {
+  timeZone: 'America/New_York', hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
+});
+
+function easternTradeMinute(date) {
+  const [hour, minute] = easternTradeClock.format(new Date(date)).split(':').map(Number);
+  return hour * 60 + minute;
+}
+
+function alpacaSession(date, conditions) {
+  const time = easternTradeMinute(date);
+  if (time < 4 * 60 || time > 20 * 60) return 'outside';
+  if (time < 9 * 60 + 30) return 'pre';
+  const extendedTrade = Array.isArray(conditions) && conditions.some((condition) => condition === 'T' || condition === 'U');
+  if (time > 16 * 60 || (time >= 13 * 60 && extendedTrade)) return 'post';
+  return null;
+}
+
 function alpacaTrade(symbol, item, priorClose) {
   const price = positiveNumber(item?.p);
   const date = validAlpacaDate(item?.t);
   if (price === null || !date) return null;
+  const session = alpacaSession(date, item.c);
+  if (session === 'outside') return null;
+  if (session) return { symbol, price, date, session, change: null };
   return { symbol, price, date, change: priorClose ? (price / priorClose - 1) * 100 : null };
 }
 
@@ -242,10 +280,12 @@ export function createAlpacaFeed(onQuotes, onStatus, requestSnapshots = alpacaSn
         const close = positiveNumber(item?.prevDailyBar?.c);
         if (close !== null) previousCloses.set(symbol, close);
         const trade = alpacaTrade(symbol, item?.latestTrade, close);
+        if (trade?.session) rows.push(trade);
+        const regular = trade?.session ? null : trade;
         const live = latestTrades.get(symbol);
-        if (live && (!trade || live.date >= trade.date)) {
+        if (live && (!regular || live.date >= regular.date)) {
           rows.push({ ...live, change: close ? (live.price / close - 1) * 100 : null });
-        } else if (trade) rows.push(trade);
+        } else if (regular) rows.push(regular);
         const book = alpacaBook(symbol, item?.latestQuote);
         if (book) rows.push(book);
       }
@@ -306,7 +346,7 @@ export function createAlpacaFeed(onQuotes, onStatus, requestSnapshots = alpacaSn
         if (item.T === 't') {
           const trade = alpacaTrade(item.S, item, previousCloses.get(item.S));
           if (trade) {
-            if ((latestTrades.get(item.S)?.date ?? '') <= trade.date) latestTrades.set(item.S, trade);
+            if (!trade.session && (latestTrades.get(item.S)?.date ?? '') <= trade.date) latestTrades.set(item.S, trade);
             rows.push(trade);
           }
         } else if (item.T === 'q') {

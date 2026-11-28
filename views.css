@@ -70,6 +70,14 @@
 .ws-market-value .ws-quote-numbers span { font-family: var(--sans); font-size: 13px; font-variant-numeric: tabular-nums; }
 .ws-market-value small { display: block; margin-top: 8px; color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; }
 .ws-market-value small a { color: var(--accent-dark); text-decoration: underline; text-underline-offset: 3px; }
+.ws-extended-quotes { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr)); gap: 7px; margin: 0 0 12px; }
+.ws-extended-quotes > div { min-width: 0; padding: 8px 10px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--paper); }
+.ws-extended-quotes dt, .ws-extended-quotes small, .ws-extended-empty { color: var(--muted); font-size: 11px; line-height: 1.45; }
+.ws-extended-quotes dd { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 8px; margin: 2px 0 0; font-variant-numeric: tabular-nums; }
+.ws-extended-quotes dd strong { color: var(--ink); font-size: 17px; font-weight: 590; overflow-wrap: anywhere; }
+.ws-extended-quotes dd span { font-size: 12px; }
+.ws-extended-quotes dd small { flex-basis: 100%; }
+.ws-extended-empty { margin: 0 0 10px; }
 .quote-signal { display: inline-flex; flex: none; align-items: center; gap: 6px; margin-top: 4px; color: var(--faint); font-size: 11px; white-space: nowrap; }
 .quote-signal::before { width: 5px; height: 5px; border-radius: 50%; background: var(--faint); content: ''; }
 .quote-signal[data-status='stream'], .quote-signal[data-status='public'] { color: var(--accent-dark); }
@@ -103,6 +111,7 @@
 .ws-watch-price { display: flex; min-width: 0; max-width: 50%; flex: none; flex-direction: column; gap: 4px; font-family: var(--sans); font-variant-numeric: tabular-nums; text-align: right; overflow-wrap: anywhere; }
 .ws-watch-price strong { font-size: 12px; font-weight: 520; }
 .ws-watch-price small { color: var(--faint); font-size: 11px; }
+.ws-watch-price .ws-watch-extended { color: var(--muted); }
 .ws-empty { padding: 17px 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .ws-market-chart .ws-empty { display: grid; min-height: 146px; place-items: center; text-align: center; }
 

@@ -91,18 +91,31 @@ function watchRow(ctx, instrument) {
   const active = ctx.symbol === symbol;
   return `<li class="ws-watch-row${active ? ' ws-watch-active' : ''}" data-watch-symbol="${escape(symbol)}"><button type="button" class="ws-watch-select" data-action="select-symbol" data-symbol="${escape(symbol)}" aria-pressed="${active}">
     <span class="ws-identity"><strong>${escape(symbol)}</strong><small>${escape(name)}<span class="watch-demo"${instrument.source === 'demo' ? '' : ' hidden'}>${name ? ' · ' : ''}演示</span></small></span>
-    <span class="ws-watch-price">${renderWatchQuote(instrument, ctx)}</span></button>${iconAction(ctx, `移除 ${symbol}`, 'delete-watch', 'trash', `data-symbol="${escape(symbol)}"`)}</li>`;
+    <span class="ws-watch-price">${renderWatchQuote(instrument, ctx, ctx.extendedQuotesFor?.(symbol))}</span></button>${iconAction(ctx, `移除 ${symbol}`, 'delete-watch', 'trash', `data-symbol="${escape(symbol)}"`)}</li>`;
 }
 
-export function renderWatchQuote(quote, ctx) {
-  return `<strong>${valueOrDash(quote.price, (value) => ctx.money(value, quote.currency))}</strong><small class="${tone(quote.change)}">${valueOrDash(quote.change, ctx.signedPercent)}</small>`;
+const sessionLabels = { pre: '盘前', post: '盘后', overnight: '夜盘' };
+const extendedSource = (item) => item.provider === 'sina' ? '新浪财经' : item.provider?.startsWith('alpaca-')
+  ? 'Alpaca ' + item.provider.slice(7).toUpperCase() : '自定义网关';
+
+export function renderWatchQuote(quote, ctx, extendedQuotes = []) {
+  const latest = extendedQuotes.reduce((newest, item) => !newest || item.date > newest.date ? item : newest, null);
+  const showExtended = latest && latest.date > (quote.date ?? '');
+  return `<strong>${valueOrDash(quote.price, (value) => ctx.money(value, quote.currency))}</strong><small class="${tone(quote.change)}">${valueOrDash(quote.change, ctx.signedPercent)}</small>${showExtended
+    ? `<small class="ws-watch-extended">${escape(sessionLabels[latest.session])} ${escape(formatPrice(latest.price, 'USD'))}</small>` : ''}`;
 }
 
-export function renderMarketQuote({ symbol, quote, orderBook, alpacaFeed, money, signedPercent }) {
+export function renderMarketQuote({ symbol, quote, orderBook, extendedQuotes = [], alpacaFeed, money, signedPercent }) {
   const markSource = quote?.provider?.startsWith('alpaca-') ? `${quote.provider.slice(7).toUpperCase()} 成交价` : sourceLabel(quote);
   const moneyHere = (value) => money(value, quote?.currency);
-  const book = alpacaFeed && symbol && quote?.currency === 'USD' ? `<div class="quote-book" aria-label="盘口报价"><div><span>买一</span><strong>${valueOrDash(orderBook?.bid, moneyHere)}</strong></div><div><span>卖一</span><strong>${valueOrDash(orderBook?.ask, moneyHere)}</strong></div><div><span>盘口时间</span><strong>${orderBook?.bookDate ? quoteDate({ date: orderBook.bookDate, currency: 'USD' }) : '—'}</strong></div></div>` : '';
-  return `<div class="ws-market-value"><div class="ws-quote-numbers"><strong>${valueOrDash(quote?.price, moneyHere)}</strong><span class="${tone(quote?.change)}">${valueOrDash(quote?.change, signedPercent)}</span></div><small>${quoteSourceLink(quote, symbol, markSource)}${quote?.date ? ` · ${quoteDate(quote)}` : ''}</small></div>${book}`;
+  const isUS = symbol && quote?.currency === 'USD';
+  const book = alpacaFeed && isUS ? `<div class="quote-book" aria-label="盘口报价"><div><span>买一</span><strong>${valueOrDash(orderBook?.bid, moneyHere)}</strong></div><div><span>卖一</span><strong>${valueOrDash(orderBook?.ask, moneyHere)}</strong></div><div><span>盘口时间</span><strong>${orderBook?.bookDate ? quoteDate({ date: orderBook.bookDate, currency: 'USD' }) : '—'}</strong></div></div>` : '';
+  const extended = isUS && extendedQuotes.length ? `<dl class="ws-extended-quotes" aria-label="美股延长时段报价">${extendedQuotes.map((item) => {
+    const change = hasNumber(item.change) && hasNumber(item.referenceClose)
+      ? `<span class="${tone(item.change)}" title="较对应常规收盘 ${escape(formatPrice(item.referenceClose, 'USD'))}">${escape(signedPercent(item.change))}</span>` : '';
+    return `<div data-session="${escape(item.session)}"><dt>${escape(sessionLabels[item.session])}</dt><dd><strong>${escape(formatPrice(item.price, 'USD'))}</strong>${change}<small>${escape(extendedSource(item))} · ${quoteDate(item)}</small></dd></div>`;
+  }).join('')}</dl>` : isUS ? '<p class="ws-extended-empty">暂无延长时段报价</p>' : '';
+  return `<div class="ws-market-value"><div class="ws-quote-numbers"><strong>${valueOrDash(quote?.price, moneyHere)}</strong><span class="${tone(quote?.change)}">${valueOrDash(quote?.change, signedPercent)}</span></div><small>${isUS ? '常规时段 · ' : ''}${quoteSourceLink(quote, symbol, markSource)}${quote?.date ? ` · ${quoteDate(quote)}` : ''}</small></div>${extended}${book}`;
 }
 
 function marketPage(ctx) {

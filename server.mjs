@@ -12,9 +12,54 @@ const files = new Map([
     [`/${name}`, [name, 'text/javascript; charset=utf-8']]),
 ]);
 
+const sinaSymbol = 'gb_[a-z][a-z0-9]{0,14}(?:\\$[a-z0-9]{1,4})?';
+const sinaQuoteUrl = new RegExp(`^https://hq\\.sinajs\\.cn/list=${sinaSymbol}(?:,${sinaSymbol}){0,29}$`);
+const maxQuoteBytes = 64 * 1024;
+const quoteHeaders = { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' };
+let quoteRequests = 0;
+
+async function serveSinaQuotes(request, response, encodedUrl) {
+  const respond = (status, body) => response.writeHead(status, quoteHeaders).end(body);
+  if (request.method !== 'GET') {
+    response.writeHead(405, { ...quoteHeaders, Allow: 'GET' }).end();
+    return;
+  }
+  if (encodedUrl.length > 1100) return respond(403);
+  let url;
+  try { url = decodeURIComponent(encodedUrl); }
+  catch { return respond(400); }
+  if (sinaQuoteUrl.exec(url)?.[0] !== url) return respond(403);
+  if (quoteRequests >= 6) return respond(429);
+
+  quoteRequests++;
+  const signal = AbortSignal.timeout(8000);
+  try {
+    const upstream = await fetch(url, { signal, cache: 'no-store', redirect: 'error',
+      headers: { Referer: 'https://finance.sina.com.cn/' } });
+    if (upstream.status !== 200 || !upstream.body || Number(upstream.headers.get('content-length')) > maxQuoteBytes) {
+      await upstream.body?.cancel();
+      return respond(502);
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of upstream.body) {
+      size += chunk.byteLength;
+      if (size > maxQuoteBytes) break;
+      chunks.push(chunk);
+    }
+    if (size > maxQuoteBytes) return respond(502);
+    return respond(200, Buffer.concat(chunks, size));
+  } catch {
+    return respond(signal.aborted ? 504 : 502);
+  } finally {
+    quoteRequests--;
+  }
+}
+
 const port = Number(process.env.MONO_PORT || 4173);
 createServer(async (request, response) => {
   const path = request.url.split('?')[0];
+  if (path === '/public-research') return serveSinaQuotes(request, response, request.url.slice(path.length + 1));
   const file = files.get(path);
   if (!file || !['GET', 'HEAD'].includes(request.method)) {
     response.writeHead(404).end();

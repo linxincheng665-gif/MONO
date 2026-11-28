@@ -164,9 +164,14 @@ a { color: inherit; text-decoration: none; }
 .allocation-legend b { color: var(--muted); }
 
 .overview-ledger { margin-top: 26px; }
-.overview-focus { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 15px; margin-top: 20px; border-left: 2px solid var(--accent); background: var(--paper); }
+.overview-focus-region { margin-top: 20px; }
+.overview-focus-region:empty { display: none; }
+.overview-focus-trigger { min-height: 36px; }
+.overview-focus { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 13px 15px; border-left: 2px solid var(--accent); background: var(--paper); }
 .overview-focus h2 { font-size: 14px; font-weight: 620; margin: 0; }
 .overview-focus p { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
+.overview-focus-actions { display: flex; flex: none; align-items: center; gap: 6px; }
+.overview-focus-dismiss { background: transparent; }
 .overview-ledger > section { border-top: 1px solid var(--line); padding-top: 10px; }
 .table-wrap { overflow-x: auto; }
 .hold-table { width: 100%; border-collapse: collapse; font-size: 13px; text-align: right; white-space: nowrap; }
@@ -298,7 +303,10 @@ dialog[open] { animation: dialog-enter var(--ease) both; }
   .overview-actions .button:hover, .overview-actions .button:active { background: var(--accent-soft); color: var(--accent-dark); }
   .metrics { order: 3; padding-block: 16px; }
   .overview-watch { order: 4; }
-  .overview-focus { order: 4; margin: 0 0 16px; }
+  .overview-focus-region { order: 4; margin: 0 0 16px; }
+  .overview-focus { gap: 10px; }
+  .overview-focus-trigger { min-height: 44px; }
+  .overview-focus-dismiss { width: 44px; min-height: 44px; }
   .allocation-panel { order: 5; }
   .overview-holdings { order: 6; }
   .overview-note { order: 7; }

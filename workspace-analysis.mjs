@@ -330,6 +330,14 @@ export function strategyKey(symbol, horizon) {
   return [symbol, ['short', 'mid', 'long'].includes(horizon) ? horizon : 'mid'].join('|');
 }
 
+export function trackedExitReviewAt(record) {
+  if (record.exitReviewSince) return record.exitReviewSince;
+  const latest = record.versions?.[0];
+  const review = latest?.positionAction === 'review-exit' || (latest?.positionAction == null &&
+    latest?.status === 'invalidated' && latest.action === '复核减仓或退出');
+  return review ? latest.at : null;
+}
+
 export function recordStrategy(record, analysis, now = Date.now()) {
   const action = analysis.decision?.action ?? '继续观察';
   const status = analysis.decision?.status ?? 'watch';
@@ -337,21 +345,28 @@ export function recordStrategy(record, analysis, now = Date.now()) {
   const level = (value) => finite(value) ? value : null;
   const horizon = analysis.horizons?.find(({ key }) => key === record.horizon);
   const marketLevels = horizon ?? (analysis.plan?.source === 'manual' ? {} : analysis);
+  const at = new Date(now).toISOString();
+  const positionAction = analysis.decision?.positionAction ?? null;
+  const previousExitReview = trackedExitReviewAt(record);
+  const exitResolved = analysis.data?.quoteStatus === 'fresh' && status !== 'blocked' && finite(horizon?.support);
+  const exitReviewSince = positionAction === 'review-exit' ? previousExitReview ?? at : exitResolved ? null : previousExitReview;
   const next = {
-    at: new Date(now).toISOString(), action, status, reason: analysis.decision?.reason ?? analysis.summary,
+    at, action, status, positionAction, reason: analysis.decision?.reason ?? analysis.summary,
     entry: level(marketLevels.entry), target: level(marketLevels.target), stop: level(marketLevels.stop),
     next: horizon?.trigger ?? analysis.decision?.next ?? analysis.decision?.reason,
     assessedOn: analysis.data?.lastBarDate ?? null,
   };
   const sameLevel = (key) => next[key] === prior?.[key] ||
     (finite(next[key]) && finite(prior?.[key]) && Math.abs(next[key] - prior[key]) <= Math.abs(prior[key]) * .005);
-  if (prior && ['action', 'status', 'next'].every((key) => next[key] === prior[key]) && ['entry', 'target', 'stop'].every(sameLevel)) return record;
+  if (prior && ['action', 'status', 'next'].every((key) => next[key] === prior[key]) && ['entry', 'target', 'stop'].every(sameLevel)) {
+    return previousExitReview === exitReviewSince ? record : { ...record, exitReviewSince };
+  }
   next.change = prior ? [
     ...(action === prior.action ? [] : [prior.action + ' → ' + action]),
     ...(['entry', 'target', 'stop'].some((key) => !sameLevel(key)) ? ['计划价位变化'] : []),
     ...(status !== prior.status || next.next !== prior.next ? ['触发条件变化'] : []),
   ].join(' · ') || '更新判断依据' : '首次记录';
-  return { ...record, versions: [next, ...(record.versions ?? [])].slice(0, MAX_HISTORY) };
+  return { ...record, exitReviewSince, versions: [next, ...(record.versions ?? [])].slice(0, MAX_HISTORY) };
 }
 
 export function evaluateResearchAlerts(alerts, { analysisFor, quoteFor, strategies, now = Date.now() }) {

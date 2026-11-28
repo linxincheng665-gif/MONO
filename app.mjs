@@ -9,7 +9,7 @@ import { renderMarketChart } from './market-chart.mjs';
 import { createChartNavigation } from './chart-navigation.mjs';
 import { runInvestmentResearch } from './investment-engine.mjs';
 import { loadResearchData, normalizeResearchEvidence, validateResearchEndpoint } from './research-data.mjs';
-import { buildRiskLab, diagnosePortfolio, evaluateAllocation, evaluateResearchAlerts, recordStrategy, strategyKey, STRATEGY_LIMIT } from './workspace-analysis.mjs';
+import { buildRiskLab, diagnosePortfolio, evaluateAllocation, evaluateResearchAlerts, recordStrategy, strategyKey, trackedExitReviewAt, STRATEGY_LIMIT } from './workspace-analysis.mjs';
 import { runQuantLab } from './quant-lab.mjs';
 import { validateModelGateway, requestModelReview } from './model-gateway.mjs';
 import { applyOpportunityPlan, candidateFor, defaultOpportunityPlan, discoverUniverse, maxCustomTickers,
@@ -94,6 +94,7 @@ const tone = (value) => value == null || value === 0 ? '' : value < 0 ? 'bad' : 
 let state = loadState();
 state.strategyJournal = Object.fromEntries(Object.entries(state.strategyJournal ?? {}).filter(([, value]) => Array.isArray(value?.versions)));
 state.researchAlerts = Array.isArray(state.researchAlerts) ? state.researchAlerts.filter((item) => item?.symbol && item.type) : [];
+state.overviewDismissals = Array.isArray(state.overviewDismissals) ? state.overviewDismissals.filter((id) => typeof id === 'string') : [];
 state.researchEvidence = state.researchEvidence && typeof state.researchEvidence === 'object' ? state.researchEvidence : {};
 state.importedResearch = state.importedResearch && typeof state.importedResearch === 'object' ? state.importedResearch : {};
 for (const [ticker, packet] of Object.entries(state.researchEvidence)) {
@@ -148,6 +149,9 @@ let publicStatus = 'idle';
 let feedFrame;
 const pendingValuations = new Set();
 const pendingBooks = new Set();
+const pendingExtended = new Set();
+const liveExtendedQuotes = new Map();
+const publicExtendedQuotes = new Map();
 let feedConfig = null;
 let alpacaConfig = null;
 try { feedConfig = validateFeed(state.feed ?? {}); } catch { /* load the local workspace without an invalid cached setting */ }
@@ -217,10 +221,32 @@ function updateFeedChip() {
   chip.dataset.status = alpacaConfig || feedConfig ? feedStatus : publicStatus;
   chip.lastElementChild.textContent = marketLabel();
 }
+function extendedQuotesFor(ticker) {
+  if (!ticker || instrumentMarket(ticker) !== 'US') return [];
+  return ['pre', 'post', 'overnight'].flatMap((session) => {
+    const key = ticker + '|' + session;
+    const live = liveExtendedQuotes.get(key), published = publicExtendedQuotes.get(key);
+    const quote = live && (!published || live.date >= published.date) ? live : published;
+    return quote && Date.now() - Date.parse(quote.date) <= 7 * 86_400_000 ? [quote] : [];
+  });
+}
 function updateQuotes(quotes, isPublic = false) {
   const store = isPublic ? state.publicQuotes : state.liveQuotes;
   for (const { symbol: ticker, ...quote } of quotes) {
     if (quote.currency && quote.currency !== instrumentCurrency(ticker)) continue;
+    if (quote.session) {
+      const time = Date.parse(quote.date);
+      if (instrumentMarket(ticker) !== 'US' || !Number.isFinite(time) || time > Date.now() + 60_000 ||
+          !Number.isFinite(quote.price) || quote.price <= 0) continue;
+      const extended = isPublic ? publicExtendedQuotes : liveExtendedQuotes;
+      const key = ticker + '|' + quote.session;
+      const previous = extended.get(key);
+      if (previous && (previous.date > quote.date ||
+          previous.date === quote.date && previous.price === quote.price && previous.change === quote.change)) continue;
+      extended.set(key, { ...quote, currency: 'USD' });
+      pendingExtended.add(ticker);
+      continue;
+    }
     const current = store[ticker];
     const mark = quote.date && (!current?.date || current.date <= quote.date);
     const book = quote.bookDate && (!current?.bookDate || current.bookDate <= quote.bookDate);
@@ -244,13 +270,14 @@ function updateQuotes(quotes, isPublic = false) {
     if (priceChanged || valuationChanged) pendingValuations.add(ticker);
     if (bookChanged) pendingBooks.add(ticker);
   }
-  if (feedFrame || (!pendingValuations.size && !pendingBooks.size)) return;
+  if (feedFrame || (!pendingValuations.size && !pendingBooks.size && !pendingExtended.size)) return;
   feedFrame = requestAnimationFrame(() => {
     feedFrame = null;
     if (page === 'market') {
-      if (pendingValuations.has(symbol) || pendingBooks.has(symbol)) {
+      if (pendingValuations.has(symbol) || pendingBooks.has(symbol) || pendingExtended.has(symbol)) {
         const target = root.querySelector('#market-mark');
-        if (target) target.innerHTML = renderMarketQuote({ symbol, quote: quoteFor(state, symbol), orderBook: state.liveQuotes[symbol], alpacaFeed: alpacaConfig?.feed, money, signedPercent });
+        if (target) target.innerHTML = renderMarketQuote({ symbol, quote: quoteFor(state, symbol), orderBook: state.liveQuotes[symbol],
+          extendedQuotes: extendedQuotesFor(symbol), alpacaFeed: alpacaConfig?.feed, money, signedPercent });
         updateQuoteSignal();
         if (pendingValuations.has(symbol)) {
           ensurePageHistory();
@@ -259,9 +286,9 @@ function updateQuotes(quotes, isPublic = false) {
       }
       for (const row of root.querySelectorAll('[data-watch-symbol]')) {
         const ticker = row.dataset.watchSymbol;
-        if (!pendingValuations.has(ticker)) continue;
+        if (!pendingValuations.has(ticker) && !pendingExtended.has(ticker)) continue;
         const quote = quoteFor(state, ticker);
-        row.querySelector('.ws-watch-price').innerHTML = renderWatchQuote(quote, { money, signedPercent });
+        row.querySelector('.ws-watch-price').innerHTML = renderWatchQuote(quote, { money, signedPercent }, extendedQuotesFor(ticker));
         row.querySelector('.watch-demo').hidden = quote.source !== 'demo';
       }
       if (pendingValuations.size) updateResults();
@@ -274,9 +301,11 @@ function updateQuotes(quotes, isPublic = false) {
         if (active && active !== document.body && !root.contains(active)) restoreFocus(active);
       } else if (page !== 'overview' && !dialog.open) updateResults();
     }
+    const reviewNeeded = pendingValuations.size > 0 || pendingBooks.size > 0;
     pendingValuations.clear();
     pendingBooks.clear();
-    queueStrategyReview();
+    pendingExtended.clear();
+    if (reviewNeeded) queueStrategyReview();
   });
 }
 
@@ -461,7 +490,8 @@ function buildContext() {
     ...portfolioWithHistory.histories,
   }, allocationCandidates, state.riskProfile) : null;
   return { state: ['holdings', 'risk'].includes(page) ? portfolio : state, portfolio: portfolioWithHistory, portfolioCurrency, displayedCurrency, privateAmounts,
-    summary, symbol, quote, orderBook, marketFilter, exchangeLabel, marketStatus: signal.status, marketLabel: signal.label, alpacaFeed: alpacaConfig?.feed,
+    summary, symbol, quote, orderBook, extendedQuotes: extendedQuotesFor(symbol), extendedQuotesFor,
+    marketFilter, exchangeLabel, marketStatus: signal.status, marketLabel: signal.label, alpacaFeed: alpacaConfig?.feed,
     history, indicators: indicators(history), tradeInputs, researchInputs,
     trade: tradePlan({ ...tradeInputs, ...tradePortfolio }), tradeCash: tradePortfolio.cash, tradeDemo: tradePortfolio.demo,
     shock, stress, strategy, diagnostics, alternative, riskLab, riskTab, riskScenario: scenario, riskSimulation: simulation,
@@ -592,6 +622,7 @@ function reviewStrategies() {
   if (changed || fired.length) {
     saveState(undefined, state);
     if (page === 'research') updateResults();
+    if (page === 'overview') refreshOverview();
   }
 }
 
@@ -679,6 +710,58 @@ function assetLink(item) {
   return `<button class="asset-link" data-action="select-symbol" data-symbol="${esc(item.symbol)}"><span class="asset-label"><strong>${esc(item.symbol)}</strong>${name}</span></button>`;
 }
 
+function overviewSteps(portfolio = scopedPortfolio(portfolioCurrency), summary = portfolioSummary(portfolio)) {
+  if (state.privateAmounts) return [];
+  const held = new Set(state.holdings.filter((item) => item.shares > 0 && item.source !== 'demo').map((item) => item.symbol));
+  const exitReviews = Object.values(state.strategyJournal).filter((item) => !item.paused && held.has(item.symbol))
+    .map((item) => ({ ...item, at: trackedExitReviewAt(item) })).filter((item) => item.at)
+    .sort((left, right) => Date.parse(right.at) - Date.parse(left.at))
+    .map(({ symbol, horizon, at }) => ({ id: `exit|${strategyKey(symbol, horizon)}|${at}`, kind: 'research', symbol, horizon,
+      message: `${symbol} 的已跟踪策略触及失效条件，请复核减仓或退出的依据。`, label: '查看策略跟踪' }));
+  const alerts = state.researchAlerts.filter((item) => item.id && item.firedAt && Object.hasOwn(alertNames, item.type))
+    .sort((left, right) => Date.parse(right.firedAt) - Date.parse(left.firedAt))
+    .map(({ id, symbol, type, key, firedAt }) => ({ id: `alert|${id}|${firedAt}`, kind: 'research', symbol, horizon: typeof key === 'string' ? key.split('|')[1] : null,
+      message: `${symbol} 的「${alertNames[type]}」提醒已触发。`, label: '查看研究提醒' }));
+  if (portfolio.demo) return alerts;
+  const prefix = `portfolio|${portfolioCurrency}|`;
+  if (summary.incomplete) {
+    const missing = [...new Set(summary.rows.filter((item) => item.shares > 0 && item.value === null).map((item) => item.symbol))].sort();
+    return [...exitReviews, { id: `${prefix}valuation|${missing.join(',')}`, message: '先补齐无法估值的持仓。', label: '核对持仓', href: '#holdings' }, ...alerts];
+  }
+  const cap = Number(state.riskProfile?.cap ?? 25);
+  const reductions = summary.allocation.filter((item) => item.label === item.symbol && item.weight > cap)
+    .map(({ symbol }) => ({ id: `${prefix}concentration|${symbol}|${cap}`, kind: 'reduction', symbol, targetWeight: cap,
+      message: `${symbol} 超过单标的上限，可先看减仓后的风险。`, label: '查看减仓风险' }));
+  const reserve = Number(state.riskProfile?.maxCashTarget ?? 20);
+  const cashReview = summary.total > 0 && summary.cashPercent < reserve ? [{ id: `${prefix}cash|${reserve}`, kind: 'cash',
+    message: '现金低于设定的储备比例，核对可用资金后再考虑加仓。', label: '核对现金' }] : [];
+  return [...exitReviews, ...reductions, ...alerts, ...cashReview];
+}
+
+function overviewFocus(portfolio, summary) {
+  const steps = overviewSteps(portfolio, summary);
+  if (!state.privateAmounts && !portfolio.demo && state.overviewDismissals.length) {
+    const prefix = `portfolio|${portfolioCurrency}|`;
+    const active = new Set(steps.map(({ id }) => id));
+    const remaining = state.overviewDismissals.filter((id) => !id.startsWith(prefix) || active.has(id) ||
+      (summary.incomplete && !id.startsWith(`${prefix}valuation|`)));
+    if (remaining.length !== state.overviewDismissals.length) {
+      state.overviewDismissals = remaining;
+      saveState(undefined, state);
+    }
+  }
+  const dismissed = new Set(state.overviewDismissals);
+  const next = steps.find(({ id }) => !dismissed.has(id));
+  if (!next) return steps.length ? `<button type="button" class="link-button overview-focus-trigger" data-action="show-overview-focus">重新查看下一步 ${icons('arrow', 14)}</button>` : '';
+  const label = `${esc(next.label)} ${icons('arrow', 14)}`;
+  const action = next.href ? `<a class="link-button" href="${next.href}">${label}</a>`
+    : `<button type="button" class="link-button" data-action="open-overview-step" data-id="${esc(next.id)}">${label}</button>`;
+  return `<section class="overview-focus" aria-labelledby="overview-focus-heading">
+    <div><h2 id="overview-focus-heading" tabindex="-1">下一步</h2><p>${esc(next.message)}</p></div>
+    <div class="overview-focus-actions">${action}<button type="button" class="icon-button overview-focus-dismiss" data-action="hide-overview-focus" aria-label="关闭下一步" title="关闭下一步">${icons('close', 17)}</button></div>
+  </section>`;
+}
+
 function overview(ctx) {
   const { summary, portfolio } = ctx;
   const trend = portfolioTrend(portfolio);
@@ -722,10 +805,7 @@ function overview(ctx) {
   const watch = ctx.watchQuotes.slice(0, 4).map((item) => `<li>${assetLink(item)}
     <span class="watch-spark-wrap">${spark(item)}</span>
     <span class="watch-values"><strong>${money(item.price, item.currency)}</strong><small class="${tone(item.change)}">${signedPercent(item.change)}</small></span></li>`).join('');
-  const todayFocus = privateValues || starter ? '' : summary.incomplete ? '先补齐无法估值的持仓。'
-    : summary.largest?.weight > (state.riskProfile?.cap ?? 25) ? `${summary.largest.symbol} 超过单标的上限，可先看减仓后的风险。`
-      : summary.cashPercent < (state.riskProfile?.maxCashTarget ?? 20) ? '现金低于设定的储备比例，核对可用资金后再考虑加仓。'
-        : '先核对筛查结果与组合敞口，再安排新增仓位。';
+  const focus = overviewFocus(portfolio, summary);
   return `<div class="overview-intro"><h1>资产总览</h1><div class="action-row overview-actions" aria-label="资产总览操作">
       <button class="button quiet overview-history" data-action="import-history">${icons('import', 15)} 导入行情</button>
       <button class="button" data-action="add-watch">${icons('plus', 16)} 添加自选</button>
@@ -752,10 +832,7 @@ function overview(ctx) {
         </section>
       </aside>
     </div>
-    <section class="overview-focus" data-overview-region="investment-focus">
-      <div><h2>下一步</h2>${todayFocus ? `<p>${esc(todayFocus)}</p>` : ''}</div>
-      <a class="link-button" href="#opportunities">投资机会 ${icons('arrow', 14)}</a>
-    </section>
+    <div class="overview-focus-region" data-overview-region="investment-focus">${focus}</div>
     <div class="overview-grid overview-ledger">
       <section class="overview-holdings">
         <header class="overview-panel-head"><h2>持仓表现</h2><a class="link-button" href="#holdings">全部持仓 ${icons('arrow', 14)}</a></header>
@@ -781,7 +858,7 @@ function renderShell() {
     <aside class="sidebar" id="mobile-drawer" aria-label="工作空间菜单">
       <div class="drawer-head"><a class="brand" href="#overview" aria-label="MONO 首页"><span>MONO</span><i aria-hidden="true"></i><img class="workspace-monogram" src="mono-icon.svg" alt="" width="32" height="32"></a><button class="icon-button" data-action="close-menu" aria-label="关闭导航">${icons('close', 19)}</button></div>
       <nav aria-label="主导航">${nav}</nav>
-      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.2</span></div>
+      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.3</span></div>
     </aside>
     <header class="topbar"><div class="topbar-content">
       <div class="topbar-brand">
@@ -1125,6 +1202,7 @@ function editAlpaca() {
     if (hasVault && !(await globalThis.MonoNative.saveAlpaca(JSON.stringify(config)))) throw new Error('当前设备无法加密保存行情凭据。');
     alpacaConfig = config;
     state.liveQuotes = {};
+    liveExtendedQuotes.clear();
     activateFeed();
     announce('正在连接 Alpaca 行情');
   }, {
@@ -1135,7 +1213,7 @@ function editAlpaca() {
 
 function marketFeedSettings() {
   const active = alpacaConfig ? `Alpaca ${alpacaConfig.feed.toUpperCase()}` : feedConfig ? '自定义网关' : '腾讯财经公开行情';
-  const fields = `<div class="feed-settings form-field full"><strong>当前优先来源</strong><span>${active}</span><small>沪深和美股的公开报价无需密钥。行情页前台每 5 秒请求一次，报价时间取自数据源。</small></div>`;
+  const fields = `<div class="feed-settings form-field full"><strong>当前优先来源</strong><span>${active}</span><small>沪深和美股常规报价来自腾讯财经。新浪财经提供美股公开盘前或盘后快照，按来源时间显示。支持夜盘的自定义网关可单独提供夜盘价。</small></div>`;
   const extra = `<button type="button" class="button" data-action="refresh-public">刷新免费行情</button><button type="button" class="button" data-action="alpaca-feed">Alpaca 美股</button><button type="button" class="button" data-action="custom-feed">自定义网关</button>${alpacaConfig || feedConfig ? '<button type="button" class="button" data-action="disconnect-feed">恢复默认来源</button>' : ''}`;
   openDialog('行情来源', fields, null, { extra });
 }
@@ -1155,6 +1233,7 @@ async function disconnectFeed() {
   feedConfig = null;
   state.feed = null;
   state.liveQuotes = {};
+  liveExtendedQuotes.clear();
   activateFeed();
   persist('已恢复默认免费行情');
   dialog.close();
@@ -1162,13 +1241,14 @@ async function disconnectFeed() {
 }
 
 function editFeed() {
-  openDialog('行情连接', `${field('url', '行情网关地址', feedConfig?.url, 'type="url" placeholder="wss://行情网关 或 https://行情网关"')}${field('interval', 'HTTPS 轮询间隔（秒）', feedConfig?.interval ?? 5, 'type="number" min="1" max="60" step="any"')}` + `<details class="form-field full"><summary>查看网关格式</summary><div>WebSocket 连接后发送订阅消息，HTTPS 使用 symbols 查询参数。两种方式均使用以下报价格式，涨跌幅单位为百分比，时间应包含时区。</div><pre>${esc(JSON.stringify({ type: 'subscribe', symbols: ['AAPL'] }))}\n${esc(JSON.stringify({ quotes: [{ symbol: 'AAPL', price: 123.45, change: 0.42, timestamp: '2026-11-24T14:30:00Z' }] }))}</pre></details>`, async (data) => {
+  openDialog('行情连接', `${field('url', '行情网关地址', feedConfig?.url, 'type="url" placeholder="wss://行情网关 或 https://行情网关"')}${field('interval', 'HTTPS 轮询间隔（秒）', feedConfig?.interval ?? 5, 'type="number" min="1" max="60" step="any"')}` + `<details class="form-field full"><summary>查看网关格式</summary><div>WebSocket 连接后发送订阅消息，HTTPS 使用 symbols 查询参数。报价时间应包含时区。美股延长时段使用 session 字段，值为 pre、post 或 overnight。提供对应常规收盘价 referenceClose 后才计算延长时段涨跌幅。</div><pre>${esc(JSON.stringify({ type: 'subscribe', symbols: ['AAPL'] }))}\n${esc(JSON.stringify({ quotes: [{ symbol: 'AAPL', price: 123.45, change: 0.42, timestamp: '2026-11-24T14:30:00Z' }] }))}</pre></details>`, async (data) => {
     const next = validateFeed(data);
     if (!(await clearStoredAlpaca())) throw new Error('无法清除 Alpaca 凭据，请重试。');
     alpacaConfig = null;
     feedConfig = next;
     state.feed = feedConfig;
     state.liveQuotes = {};
+    liveExtendedQuotes.clear();
     activateFeed();
     persist(feedConfig ? '行情网关设置已保存' : '已恢复默认免费行情');
   }, { description: 'WSS 支持推送，HTTPS 支持 1–60 秒轮询。网关无报价时，使用可用的免费行情。清空地址可恢复默认来源。', submit: '应用连接', extra: '<button type="button" class="button" data-action="market-feed">行情来源</button>' });
@@ -1181,6 +1261,39 @@ function settings() {
     root.querySelector('.shell').dataset.marketPalette = state.pricePalette;
     persist('显示设置已保存');
   }, { description: state.demo ? '当前工作区含预置的演示持仓与报价。可保留已录入的数据，只移除预置示例。' : '持仓、自选、研究记录和交易计划均保存在本机。', extra: `<button type="button" class="button" data-action="set-cash">设置现金</button><button type="button" class="button" data-action="market-feed">行情连接</button>${state.demo ? '<button type="button" class="button" data-action="clear-demo">移除演示数据</button>' : ''}` });
+}
+
+function setOverviewFocus(open) {
+  const steps = overviewSteps();
+  if (!steps.length) return;
+  const ids = steps.map(({ id }) => id);
+  state.overviewDismissals = open ? state.overviewDismissals.filter((id) => id !== ids[0])
+    : [...new Set([...state.overviewDismissals, ...ids])].slice(-160);
+  persist();
+  refreshOverview();
+  root.querySelector(open ? '#overview-focus-heading' : '[data-action="show-overview-focus"]')?.focus({ preventScroll: true });
+}
+
+function openOverviewStep(id) {
+  const next = overviewSteps().find((item) => item.id === id);
+  if (!next) {
+    refreshOverview();
+    return;
+  }
+  if (next.kind === 'cash') return setCash();
+  if (next.kind === 'reduction') {
+    riskSimulation[portfolioCurrency] = { symbol: next.symbol, targetWeight: next.targetWeight };
+    riskTab = 'simulation';
+    navigate('risk');
+  } else if (next.kind === 'research') {
+    selectInstrument(next.symbol);
+    discoveredSymbol = next.symbol;
+    const horizon = ['short', 'mid', 'long'].includes(next.horizon) ? next.horizon : state.research[next.symbol]?.horizon ?? 'mid';
+    state.research[next.symbol] = { ...state.research[next.symbol], horizon };
+    researchTab = 'tracking';
+    persist();
+    navigate('research');
+  }
 }
 
 function clearDemo() {
@@ -1578,6 +1691,8 @@ root.addEventListener('click', (event) => {
   const { action, id, symbol: ticker, range: selectedRange } = button.dataset;
   const actions = {
     'toggle-menu': () => setMenu(!menu), 'close-menu': () => setMenu(false),
+    'show-overview-focus': () => setOverviewFocus(true), 'hide-overview-focus': () => setOverviewFocus(false),
+    'open-overview-step': () => openOverviewStep(id),
     'add-holding': () => editHolding(), 'edit-holding': () => editHolding(id), 'delete-holding': () => deleteRecord('holding', id),
     'set-cash': setCash, 'add-watch': addWatch, 'delete-watch': () => deleteRecord('watch', ticker),
     'select-symbol': () => {
@@ -1723,7 +1838,7 @@ dialog.addEventListener('click', (event) => {
   if (action === 'market-feed') marketFeedSettings();
   if (action === 'alpaca-feed') editAlpaca();
   if (action === 'custom-feed') editFeed();
-  if (action === 'refresh-public') { void publicFeed.refresh(); dialog.close(); }
+  if (action === 'refresh-public') { void publicFeed.refresh({ forceExtended: true }); dialog.close(); }
   if (action === 'disconnect-feed') disconnectFeed();
   if (action === 'clear-demo') clearDemo();
   if (action === 'chart-period') {

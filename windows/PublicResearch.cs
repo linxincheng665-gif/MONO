@@ -1,6 +1,7 @@
 using System;
 using System.IO;
 using System.Net;
+using System.Net.Cache;
 using System.Text.RegularExpressions;
 using System.Threading;
 
@@ -9,6 +10,9 @@ namespace Mono.Research.Windows
     internal static class PublicResearch
     {
         private const int MaxBytes = 12000000;
+        private const int MaxQuoteBytes = 64 * 1024;
+        private const string SinaSymbol = @"gb_[a-z][a-z0-9]{0,14}(?:\$[a-z0-9]{1,4})?";
+        private static readonly Regex SinaQuoteUrl = new Regex(@"\Ahttps://hq\.sinajs\.cn/list=" + SinaSymbol + "(?:," + SinaSymbol + @"){0,29}\z");
         private static readonly SemaphoreSlim Slots = new SemaphoreSlim(6);
         private static readonly object SecThrottle = new object();
         private static DateTime nextSecRequest;
@@ -40,6 +44,8 @@ namespace Mono.Research.Windows
                     return path == "/us/en/intermediary/etfs/state-street-spdr-sp-500-etf-trust-spy" && query.Length == 0;
                 case "feeds.finance.yahoo.com":
                     return path == "/rss/2.0/headline" && Regex.IsMatch(query, @"^\?s=[A-Z][A-Z0-9.-]{0,13}&region=US&lang=en-US$");
+                case "hq.sinajs.cn":
+                    return SinaQuoteUrl.IsMatch(uri.OriginalString);
                 case "news.google.com":
                     return path == "/rss/search" && Regex.IsMatch(query, @"^\?q=""[\p{L}\p{N} .·（）()\-]{1,100}""&hl=zh-CN&gl=CN&ceid=CN:zh-Hans$");
                 default: return false;
@@ -51,6 +57,8 @@ namespace Mono.Research.Windows
             status = 403;
             Uri uri;
             if (raw.Length > 1100 || !Uri.TryCreate(raw, UriKind.Absolute, out uri) || !Allowed(uri)) return new byte[0];
+            bool sinaQuote = uri.Host == "hq.sinajs.cn";
+            int maxBytes = sinaQuote ? MaxQuoteBytes : MaxBytes;
             status = 429;
             if (!Slots.Wait(0)) return new byte[0];
             try
@@ -71,18 +79,23 @@ namespace Mono.Research.Windows
                 request.UserAgent = "MONO Public Research/3.2";
                 if (uri.Host == "query.sse.com.cn") request.Referer = "https://www.sse.com.cn/";
                 if (uri.Host == "api.fund.eastmoney.com") request.Referer = "https://fundf10.eastmoney.com/";
+                if (sinaQuote)
+                {
+                    request.Referer = "https://finance.sina.com.cn/";
+                    request.CachePolicy = new RequestCachePolicy(RequestCacheLevel.NoCacheNoStore);
+                }
                 request.AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate;
                 using (var response = (HttpWebResponse)request.GetResponse())
                 using (var stream = response.GetResponseStream())
                 using (var buffer = new MemoryStream())
                 {
                     status = 502;
-                    if (response.StatusCode != HttpStatusCode.OK || response.ContentLength > MaxBytes) return new byte[0];
+                    if (response.StatusCode != HttpStatusCode.OK || response.ContentLength > maxBytes) return new byte[0];
                     var chunk = new byte[8192];
                     int count;
                     while ((count = stream.Read(chunk, 0, chunk.Length)) > 0)
                     {
-                        if (buffer.Length + count > MaxBytes) return new byte[0];
+                        if (buffer.Length + count > maxBytes) return new byte[0];
                         buffer.Write(chunk, 0, count);
                     }
                     status = 200;
