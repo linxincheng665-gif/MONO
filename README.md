@@ -1,6 +1,6 @@
 # MONO
 
-MONO 是面向个人投资者的研究终端，支持 Web、Android 和 Windows。当前源码版本为 3.3.4。
+MONO 是面向个人投资者的研究终端，支持 Web、Android 和 Windows。当前源码版本为 3.3.5。
 
 ## 功能
 
@@ -33,7 +33,7 @@ npm start
 .\android\build.ps1
 ```
 
-脚本会在本机创建用于签名的文件，并在仓库根目录生成 `MONO-3.3.4.apk`。更新本机此前构建的 APK 时，需使用原签名。
+脚本会在本机创建用于签名的文件，并在仓库根目录生成 `MONO-3.3.5.apk`。更新本机此前构建的 APK 时，需使用原签名。
 
 ### Windows x64
 
@@ -43,7 +43,7 @@ npm start
 .\windows\build.ps1 -WebViewPackage "C:\path\to\Microsoft.Web.WebView2.nupkg"
 ```
 
-解压生成的 `MONO-3.3.4-Windows.zip`，打开 `MONO.exe`。
+解压生成的 `MONO-3.3.5-Windows.zip`，打开 `MONO.exe`。
 
 ## 数据与配置
 
@@ -52,6 +52,8 @@ npm start
 美股行情页同时显示常规报价和可取得的延长时段报价。公开盘前或盘后快照来自新浪财经，并标明美东时间。支持延长时段的自定义网关可通过 `session` 标明 `pre`、`post` 或 `overnight`，并使用 `referenceClose` 提供对应的常规收盘价。组合估值和策略提醒使用常规报价。
 
 持仓与配置保存在本机。外部模型服务可选，配置后由用户主动调用。接口与研究数据格式可参考以下版本文档。
+
+可从「数据与设置 → 备份与恢复」导出工作区 JSON。恢复前会显示预览并要求确认替换。备份含持仓、历史行情及研究记录等本机数据。行情和模型连接配置及密钥继续保存在原设备。
 
 - [3.2 接口与数据说明](MONO-3.2-接口与数据说明.md)
 - [3.1 研究数据导入说明](MONO-3.1-研究数据.md)

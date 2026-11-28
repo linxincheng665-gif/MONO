@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">MONO</string>
-    <string name="choose_history">选择 CSV 或 TSV 行情文件</string>
+    <string name="choose_data_file">选择 MONO 数据文件</string>
     <string name="chooser_unavailable">此设备没有可用的文件选择器。</string>
     <color name="mono_porcelain">#FFFFFF</color>
     <color name="mono_accent">#2346E8</color>

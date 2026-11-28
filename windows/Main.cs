@@ -5,6 +5,7 @@ using System.Drawing;
 using System.IO;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Web.WebView2.Core;
@@ -37,6 +38,9 @@ namespace Mono.Research.Windows
         private const string Host = "mono.windows.local";
         private const string StartPage = "https://" + Host + "/index.html";
         private const string RuntimeDownload = "https://developer.microsoft.com/microsoft-edge/webview2/#download";
+        private const string WorkspaceMessage = "mono-workspace\n";
+        private const int MaxBackupBytes = 5 * 1024 * 1024;
+        private static readonly Regex BackupFilename = new Regex(@"\A[A-Za-z0-9][A-Za-z0-9._-]{0,89}\.json\z", RegexOptions.CultureInvariant);
         private const string Headers = "Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             + "img-src 'self' data:; font-src 'self'; connect-src https: wss:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\r\n"
             + "X-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nCache-Control: no-store";
@@ -54,6 +58,7 @@ namespace Mono.Research.Windows
         private readonly AlpacaVault vault;
         private CoreWebView2Environment environment;
         private bool smokeRunning;
+        private bool savingBackup;
 
         internal MonoWindow(string profile, string smokeReport)
         {
@@ -97,7 +102,7 @@ namespace Mono.Research.Windows
                 core.NavigationStarting += BlockExternalNavigation;
                 core.NewWindowRequested += BlockNewWindow;
                 core.PermissionRequested += (o, e) => e.State = CoreWebView2PermissionState.Deny;
-                core.WebMessageReceived += AcceptVaultMessage;
+                core.WebMessageReceived += AcceptWebMessage;
                 core.NavigationCompleted += Loaded;
                 using (var script = new StreamReader(Assembly.GetExecutingAssembly().GetManifestResourceStream("Mono.Windows.Vault")))
                     await core.AddScriptToExecuteOnDocumentCreatedAsync(script.ReadToEnd());
@@ -179,11 +184,120 @@ namespace Mono.Research.Windows
                 reason, Headers + "\r\nContent-Type: text/plain; charset=utf-8");
         }
 
-        private void AcceptVaultMessage(object sender, CoreWebView2WebMessageReceivedEventArgs args)
+        private static bool IsWorkspacePage(string url)
         {
             Uri uri;
-            if (!Uri.TryCreate(args.Source, UriKind.Absolute, out uri) || !IsLocal(uri) || uri.AbsolutePath != "/index.html") return;
-            vault.Answer(web.CoreWebView2, args.WebMessageAsJson);
+            return Uri.TryCreate(url, UriKind.Absolute, out uri) && IsLocal(uri) && uri.AbsolutePath == "/index.html";
+        }
+
+        private void AcceptWebMessage(object sender, CoreWebView2WebMessageReceivedEventArgs args)
+        {
+            if (!IsWorkspacePage(args.Source)) return;
+            string message;
+            try
+            {
+                message = args.TryGetWebMessageAsString();
+            }
+            catch (ArgumentException)
+            {
+                vault.Answer(web.CoreWebView2, args.WebMessageAsJson);
+                return;
+            }
+            if (message != null && message.StartsWith(WorkspaceMessage, StringComparison.Ordinal))
+                AcceptBackupMessage(message);
+        }
+
+        private void AcceptBackupMessage(string message)
+        {
+            int requestStart = WorkspaceMessage.Length;
+            int filenameStart = requestStart + 37;
+            if (message.Length <= filenameStart || message[filenameStart - 1] != '\n') return;
+            Guid request;
+            if (!Guid.TryParseExact(message.Substring(requestStart, 36), "D", out request)) return;
+
+            int filenameEnd = message.IndexOf('\n', filenameStart, Math.Min(message.Length - filenameStart, 96));
+            if (savingBackup || filenameEnd < 0 || filenameEnd == message.Length - 1 ||
+                message.Length - filenameEnd - 1 > MaxBackupBytes)
+            {
+                ReplyToBackup(request, "error");
+                return;
+            }
+            string filename = message.Substring(filenameStart, filenameEnd - filenameStart);
+            string contents = message.Substring(filenameEnd + 1);
+            if (!BackupFilename.IsMatch(filename) || Encoding.UTF8.GetByteCount(contents) > MaxBackupBytes)
+            {
+                ReplyToBackup(request, "error");
+                return;
+            }
+            SaveWorkspaceBackup(request, filename, contents);
+        }
+
+        private async void SaveWorkspaceBackup(Guid request, string filename, string contents)
+        {
+            savingBackup = true;
+            string result = "error";
+            try
+            {
+                // Leave the WebView2 callback before entering a modal dialog.
+                await Task.Yield();
+                if (IsDisposed || !IsWorkspacePage(web.CoreWebView2.Source)) return;
+                using (var save = new SaveFileDialog
+                {
+                    Title = "保存 MONO 工作区备份",
+                    FileName = filename,
+                    DefaultExt = "json",
+                    Filter = "MONO 工作区备份 (*.json)|*.json",
+                    AddExtension = true,
+                    CheckPathExists = true,
+                    OverwritePrompt = true,
+                    RestoreDirectory = true,
+                })
+                {
+                    if (save.ShowDialog(this) != DialogResult.OK)
+                    {
+                        result = "cancelled";
+                        return;
+                    }
+                    string path = save.FileName;
+                    if (!String.Equals(Path.GetExtension(path), ".json", StringComparison.OrdinalIgnoreCase)) return;
+                    await Task.Run(() => WriteWorkspaceBackup(path, contents));
+                    result = "saved";
+                }
+            }
+            catch (Exception error)
+            {
+                if (!(error is IOException || error is UnauthorizedAccessException || error is ArgumentException ||
+                    error is NotSupportedException || error is InvalidOperationException ||
+                    error is System.Security.SecurityException || error is System.ComponentModel.Win32Exception)) throw;
+            }
+            finally
+            {
+                savingBackup = false;
+                ReplyToBackup(request, result);
+            }
+        }
+
+        private static void WriteWorkspaceBackup(string path, string contents)
+        {
+            string staged = Path.Combine(Path.GetDirectoryName(path), ".mono-backup-" + Guid.NewGuid().ToString("N") + ".tmp");
+            try
+            {
+                using (var stream = new FileStream(staged, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                    writer.Write(contents);
+                if (File.Exists(path)) File.Replace(staged, path, null);
+                else File.Move(staged, path);
+            }
+            finally
+            {
+                File.Delete(staged);
+            }
+        }
+
+        private void ReplyToBackup(Guid request, string result)
+        {
+            if (IsDisposed || web.CoreWebView2 == null || !IsWorkspacePage(web.CoreWebView2.Source)) return;
+            web.CoreWebView2.PostWebMessageAsJson("{\"channel\":\"mono-workspace\",\"id\":\"" + request.ToString("D") + "\",\"result\":\"" + result + "\"}");
         }
 
         private async void Loaded(object sender, CoreWebView2NavigationCompletedEventArgs args)
@@ -222,6 +336,8 @@ namespace Mono.Research.Windows
                 if (!fontLoaded) throw new InvalidOperationException("The bundled Inter font could not load.");
                 const string storageCheck = "(function(){var key='mono-windows-smoke'; localStorage.setItem(key,'ok'); var result=localStorage.getItem(key)==='ok'; localStorage.removeItem(key); return result;})()";
                 if (await web.CoreWebView2.ExecuteScriptAsync(storageCheck) != "true") throw new InvalidOperationException("Local storage is unavailable.");
+                const string backupCheck = "typeof MonoWorkspace?.saveBackup === 'function' && MonoWorkspace.saveBackup('../unsafe.json', '{}') === false";
+                if (await web.CoreWebView2.ExecuteScriptAsync(backupCheck) != "true") throw new InvalidOperationException("The workspace backup bridge is unavailable.");
 
                 await web.CoreWebView2.ExecuteScriptAsync("location.hash='#market'");
                 string title = "null";
@@ -258,7 +374,7 @@ namespace Mono.Research.Windows
                 }
                 if (!encrypted) throw new InvalidOperationException("Encrypted credential storage is unavailable.");
 
-                File.WriteAllText(smokeReport, "OK\r\nWebView2 " + environment.BrowserVersionString + "\r\nSecure origin, bundled Inter font, local storage, market and quant views, research source allowlist and Windows credential vault verified.\r\n", new UTF8Encoding(false));
+                File.WriteAllText(smokeReport, "OK\r\nWebView2 " + environment.BrowserVersionString + "\r\nSecure origin, bundled Inter font, local storage, market and quant views, workspace backup bridge, research source allowlist and Windows credential vault verified.\r\n", new UTF8Encoding(false));
                 Close();
             }
             catch (Exception error) { Fail(error); }

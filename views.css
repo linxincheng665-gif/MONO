@@ -22,6 +22,8 @@
 .ws-section-meta { color: var(--faint); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .ws-footnote, .ws-result-lead p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.65; }
 .ws-valuation-note { margin-top: 14px; }
+.ws-valuation-source { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.4; white-space: normal; }
+.ws-valuation-source a { color: var(--accent-dark); text-decoration: underline; text-underline-offset: 2px; }
 .ws-spaced { margin-top: var(--ws-section-gap); }
 
 .ws-actions, .ws-row-actions, .ws-result-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }

@@ -328,8 +328,11 @@ export function evaluateAllocation(summary, histories, candidates, { cap = 25, m
   const reserve = total * maxCashTarget / 100;
   const trims = Math.max(0, largest.value - capValue);
   const currentMaps = eligible.map(({ symbol }) => dateCloses(histories[symbol], cutoff));
-  const fresh = candidates.filter((item) => item.market && finite(item.entry) && finite(item.stop) && item.entry > item.stop &&
-    ['opportunity', 'watch'].includes(item.status)).sort((a, b) => Number(b.status === 'opportunity') - Number(a.status === 'opportunity'));
+  const fresh = candidates.filter((item) => {
+    const quoteAge = now - Date.parse(item.quoteDate);
+    return item.market && finite(item.entry) && finite(item.stop) && item.entry > item.stop &&
+      item.status === 'opportunity' && quoteAge >= -60_000 && quoteAge <= 300_000;
+  });
   const views = [];
   for (const item of fresh) {
     const current = eligible.find(({ symbol }) => symbol === item.ticker);

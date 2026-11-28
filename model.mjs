@@ -1,6 +1,9 @@
 import { buyQuantityRules, instrumentCurrency, normalizeTicker } from './instruments.mjs';
 
 const storageKey = "mono-investment-workspace-v2";
+const protectedWorkspace = Symbol("protectedWorkspace");
+const backupFormat = "mono-workspace";
+export const workspaceBackupLimit = 5 * 1024 * 1024;
 
 const macroAssessments = new Map([
   ["tailwind", { status: "pass", detail: "研究记录为顺风" }],
@@ -74,10 +77,13 @@ function mergeHistory(previous, next) {
   return [...new Map(rows.map((row) => [row.date, row])).values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
-export function loadState(storage) {
+export function loadState(storage, onProblem) {
+  let raw;
   try {
-    const data = JSON.parse((storage ?? globalThis.localStorage)?.getItem(storageKey));
-    if (!data || !Array.isArray(data.holdings) || !Array.isArray(data.watchlist)) return emptyWorkspace();
+    raw = (storage ?? globalThis.localStorage).getItem(storageKey);
+    if (raw == null) return emptyWorkspace();
+    const data = JSON.parse(raw);
+    if (!isRecord(data) || !Array.isArray(data.holdings) || !Array.isArray(data.watchlist)) throw new Error("Invalid workspace");
     return {
       ...data,
       cash: nonnegative(data.cash) ?? 0,
@@ -92,18 +98,149 @@ export function loadState(storage) {
       demo: data.demo === true,
     };
   } catch {
-    return emptyWorkspace();
+    const fallback = emptyWorkspace();
+    Object.defineProperty(fallback, protectedWorkspace, { value: true });
+    onProblem?.(raw === undefined ? "unavailable" : "damaged");
+    return fallback;
   }
 }
 
 export function saveState(storage, state) {
+  if (state[protectedWorkspace]) return false;
   try {
     const { liveQuotes, publicQuotes, ...saved } = state;
-    (storage ?? globalThis.localStorage).setItem(storageKey, JSON.stringify(saved));
+    const target = storage ?? globalThis.localStorage;
+    try {
+      target.setItem(storageKey, JSON.stringify(saved));
+    } catch (error) {
+      // At quota, discard only fetched research snapshots. User-imported data stays in the workspace.
+      const research = Object.entries(isRecord(saved.researchEvidence) ? saved.researchEvidence : {});
+      const imported = research.filter(([, packet]) => packet?.imported);
+      if (error?.name !== "QuotaExceededError" || research.length === imported.length) return false;
+      target.setItem(storageKey, JSON.stringify({ ...saved, researchEvidence: Object.fromEntries(imported) }));
+    }
     return true;
   } catch {
     return false;
   }
+}
+
+const portableFields = {
+  holdings: "id symbol name shares cost price date source",
+  watchlist: "symbol name price change date source",
+  trades: "id symbol entry target stop amount riskPercent fractional shares investment ratio risk reward costBps gapPercent budgetExit budgetRisk createdAt",
+  researchAlerts: "id symbol key type createdAt date price baseline firedAt observedPrice observedAt quoteDate",
+  research: "horizon assetType instrumentType riskPercent amount entry target stop costBps gapPercent nav expenseRatio maxExpenseRatio pe fairValue revenueGrowth macro eventsStatus event sentiment fundamentalSource fundamentalDate valuationSource valuationDate macroSource macroDate eventSource eventDate sentimentSource sentimentDate",
+  chartPrefs: "period type scale cost ma20 ma50 volume area",
+  riskProfile: "cap maxCashTarget",
+  quantSettings: "fast slow breakout holding costBps optimize",
+  opportunityPlan: "scope market horizon trend minRatio minReturn maxVolatility minVolume",
+  opportunityDefaultFilters: "market horizon",
+};
+
+function backupRecord(value, fields) {
+  if (!isRecord(value)) throw new Error("备份中的记录格式无效。");
+  return Object.fromEntries(fields.split(" ").filter((key) => Object.hasOwn(value, key)).map((key) => {
+    const item = value[key];
+    if (item != null && !["string", "boolean"].includes(typeof item) && !Number.isFinite(item)) throw new Error("备份中的字段格式无效。");
+    return [key, item];
+  }));
+}
+
+function backupList(rows, map) {
+  if (!Array.isArray(rows)) throw new Error("备份中缺少必要的列表。");
+  return rows.map(map);
+}
+
+function backupSymbol(value) {
+  const symbol = typeof value === "string" ? normalizeTicker(value) : "";
+  if (!symbol) throw new Error("备份中包含无效标的代码。");
+  return symbol;
+}
+
+function backupMap(value, read) {
+  if (value == null) return {};
+  if (!isRecord(value)) throw new Error("备份中标的数据格式无效。");
+  return Object.fromEntries(Object.entries(value).map(([key, record]) => [backupSymbol(key), read(record)]));
+}
+
+function portableWorkspace(state) {
+  const result = backupRecord(state, "cash cashCny demo pricePalette portfolioCurrency privateAmounts opportunityMode");
+  for (const name of ["cash", "cashCny"]) {
+    if (result[name] != null && nonnegative(result[name]) === null) throw new Error("备份中的现金余额无效。");
+    result[name] = nonnegative(result[name]) ?? 0;
+  }
+  for (const name of ["holdings", "watchlist", "trades", "researchAlerts"]) {
+    const rows = state[name] ?? (name === "trades" || name === "researchAlerts" ? [] : null);
+    result[name] = backupList(rows, (row) => {
+      const record = backupRecord(row, portableFields[name]);
+      record.symbol = backupSymbol(record.symbol);
+      if (name === "holdings" && nonnegative(record.shares) === null) throw new Error("备份中的持仓数量无效。");
+      if (name === "trades" && record.shares == null && isRecord(row.result)) record.shares = nonnegative(row.result.shares);
+      return record;
+    });
+  }
+  result.histories = backupMap(state.histories, (rows) => backupList(rows, (row) => {
+    const bar = backupRecord(row, "date open high low close volume complete adjusted");
+    if (typeof bar.date !== "string" || dailyDate(bar.date) !== bar.date || positive(bar.close) === null) {
+      throw new Error("备份中存在无效历史行情。");
+    }
+    bar.close = positive(bar.close);
+    return bar;
+  }));
+  result.research = backupMap(state.research, (row) => backupRecord(row, portableFields.research));
+  if (state.strategyJournal != null && !isRecord(state.strategyJournal)) throw new Error("备份中策略跟踪格式无效。");
+  result.strategyJournal = Object.fromEntries(Object.values(state.strategyJournal ?? {}).map((row) => {
+    const tracked = backupRecord(row, "symbol horizon paused exitReviewSince");
+    tracked.symbol = backupSymbol(tracked.symbol);
+    if (!["short", "mid", "long"].includes(tracked.horizon)) throw new Error("备份中策略周期无效。");
+    tracked.versions = backupList(row.versions, (version) =>
+      backupRecord(version, "at action status positionAction reason entry target stop next assessedOn change"));
+    return [tracked.symbol + "|" + tracked.horizon, tracked];
+  }));
+  result.importedResearch = backupMap(state.importedResearch, (packet) => {
+    const imported = { ...backupRecord(packet, "symbol fetchedAt"), imported: true };
+    for (const section of ["macro", "fundamentals", "valuation", "events", "sentiment"]) {
+      imported[section] = backupList(packet[section] ?? [], (row) =>
+        backupRecord(row, "label value unit asOf publishedAt source url detail metric kind scope"));
+    }
+    return imported;
+  });
+  for (const name of ["chartPrefs", "riskProfile", "quantSettings", "opportunityPlan", "opportunityDefaultFilters"]) {
+    if (state[name] == null) continue;
+    result[name] = backupRecord(state[name], portableFields[name]);
+  }
+  if (state.opportunityPlan?.symbols != null) result.opportunityPlan.symbols = backupList(state.opportunityPlan.symbols, backupSymbol);
+  result.overviewDismissals = backupList(state.overviewDismissals ?? [], (id) => {
+    if (typeof id !== "string") throw new Error("备份中提醒记录格式无效。");
+    return id;
+  });
+  return result;
+}
+
+export function createWorkspaceBackup(state, now = Date.now()) {
+  const packet = { format: backupFormat, version: 1, createdAt: new Date(now).toISOString(), workspace: portableWorkspace(state) };
+  const json = JSON.stringify(packet);
+  if (new TextEncoder().encode(json).length > workspaceBackupLimit) throw new Error("工作区备份超过 5 MB。");
+  return json;
+}
+
+export function readWorkspaceBackup(text) {
+  if (typeof text !== "string" || new TextEncoder().encode(text).length > workspaceBackupLimit) throw new Error("请选择 5 MB 以内的 MONO JSON 备份。");
+  let packet;
+  try { packet = JSON.parse(text.replace(/^\uFEFF/, "")); }
+  catch { throw new Error("此文件无法读取为 MONO JSON 备份。"); }
+  if (packet?.format !== backupFormat || packet.version !== 1 || typeof packet.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(packet.createdAt))) {
+    throw new Error("此文件不是受支持的 MONO 工作区备份。");
+  }
+  return { createdAt: packet.createdAt, workspace: portableWorkspace(packet.workspace) };
+}
+
+export function restoreWorkspaceBackup(current, backup, storage) {
+  const restored = { ...backup.workspace, liveQuotes: {}, publicQuotes: {}, researchEvidence: {},
+    feed: current.feed, researchEndpoint: current.researchEndpoint, modelGateway: current.modelGateway };
+  return saveState(storage, restored) ? restored : null;
 }
 
 function isRecord(value) {
@@ -160,36 +297,46 @@ export function quoteFor(state, symbol) {
   const publicPrice = positive(publicQuote?.price);
   const publicDate = timestamp(publicQuote?.date);
   const hasPublic = publicPrice !== null && publicDate !== null && publicQuote.currency === currency;
-  if (livePrice !== null && liveDate !== null && (!stream.currency || stream.currency === currency) &&
-      (!hasPublic || Date.parse(publicDate) - Date.parse(liveDate) <= 90_000)) {
-    return { price: livePrice, change: number(stream.change), date: liveDate, source: "live", currency, provider: stream.provider };
-  }
 
   const history = historyFor(state, normalized);
   const recent = history.at(-1);
   const prior = history.at(-2);
-  const entries = [...state.holdings, ...state.watchlist].filter((item) => (
-    ticker(item.symbol) === normalized && positive(item.price) !== null
-  ));
-  const manual = entries.filter((entry) => entry.source !== "demo").sort((left, right) => (
-    (timestamp(right.date) ?? "").localeCompare(timestamp(left.date) ?? "")
-  ))[0];
-  const manualDate = timestamp(manual?.date);
-  const historyDate = timestamp(recent?.date);
+  const recentClose = positive(recent?.close);
+  let manual, demo, demoWithChange;
+  let manualDate = null;
+  for (const entry of [...state.holdings, ...state.watchlist]) {
+    if (ticker(entry.symbol) !== normalized || positive(entry.price) === null) continue;
+    if (entry.source === "demo") {
+      demo ??= entry;
+      if (number(entry.change) !== null) demoWithChange ??= entry;
+    } else {
+      const date = timestamp(entry.date);
+      if (!manual || (date ?? "") > (manualDate ?? "")) {
+        manual = entry;
+        manualDate = date;
+      }
+    }
+  }
+  const historyDate = recentClose === null ? null : timestamp(recent.date);
+  if (livePrice !== null && liveDate !== null && (!stream.currency || stream.currency === currency) &&
+      liveDate >= (manualDate ?? "") && liveDate >= (historyDate ?? "") &&
+      (!hasPublic || Date.parse(publicDate) - Date.parse(liveDate) <= 90_000)) {
+    return { price: livePrice, change: number(stream.change), date: liveDate, source: "live", currency, provider: stream.provider };
+  }
   if (hasPublic && publicDate >= (manualDate ?? '') && publicDate >= (historyDate ?? '')) {
     return { price: publicPrice, change: number(publicQuote.change), date: publicDate, source: 'public', currency };
   }
-  if (positive(recent?.close) !== null && (manualDate === null || (historyDate !== null && manualDate <= historyDate))) {
+  if (recentClose !== null && (manualDate === null || (historyDate !== null && manualDate <= historyDate))) {
     return {
-      price: Number(recent.close),
-      change: positive(prior?.close) === null ? null : percentage(recent.close - prior.close, prior.close),
+      price: recentClose,
+      change: positive(prior?.close) === null ? null : percentage(recentClose - prior.close, prior.close),
       date: recent.date,
       source: "imported",
       currency,
     };
   }
 
-  const entry = manual ?? entries.find((item) => number(item.change) !== null) ?? entries[0];
+  const entry = manual ?? demoWithChange ?? demo;
   return {
     price: positive(entry?.price),
     change: number(entry?.change),
@@ -199,16 +346,23 @@ export function quoteFor(state, symbol) {
   };
 }
 
-export function portfolioSummary(state) {
+export function portfolioSummary(state, { now = Date.now() } = {}) {
   const cash = nonnegative(state.cash) ?? 0;
+  const quotes = new Map();
   const positions = state.holdings.map((holding) => {
-    const { price, source } = quoteFor(state, holding.symbol);
+    const symbol = ticker(holding.symbol);
+    if (!quotes.has(symbol)) quotes.set(symbol, quoteFor(state, symbol));
+    const { price, source, date, provider } = quotes.get(symbol);
+    const instant = timestamp(date);
+    const quoteDate = instant && typeof date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(date) ? date : instant;
+    const quoteOver24Hours = ["public", "live"].includes(source) && now - Date.parse(quoteDate) > 86_400_000;
     const shares = nonnegative(holding.shares) ?? 0;
     const cost = nonnegative(holding.cost);
     const value = price === null ? null : shares * price;
     const basis = cost === null ? null : shares * cost;
     const pnl = value === null || basis === null ? null : value - basis;
-    return { ...holding, shares, cost, price, value, basis, pnl, pnlPercent: pnl === null ? null : percentage(pnl, basis), source };
+    return { ...holding, shares, cost, price, value, basis, pnl, pnlPercent: pnl === null ? null : percentage(pnl, basis),
+      source, quoteDate, quoteProvider: provider, quoteOver24Hours };
   });
   const invested = positions.reduce((sum, row) => sum + (row.value ?? 0), 0);
   const total = invested + cash;
@@ -232,10 +386,18 @@ export function portfolioSummary(state) {
   const pricedWithCost = rows.filter((row) => row.pnl !== null);
   const pnl = pricedWithCost.reduce((sum, row) => sum + row.pnl, 0);
   const pnlBasis = pricedWithCost.reduce((sum, row) => sum + row.basis, 0);
-  const incomplete = rows.some((row) => row.shares > 0 && row.price === null);
+  const openPositions = rows.filter((row) => row.shares > 0);
+  const symbols = [...new Map(openPositions.map((row) => [ticker(row.symbol), row])).values()];
+  const valuation = { total: symbols.length, priced: symbols.filter((row) => row.price !== null).length,
+    manual: symbols.filter((row) => row.source === "manual").length,
+    imported: symbols.filter((row) => row.source === "imported").length,
+    over24Hours: symbols.filter((row) => row.quoteOver24Hours).length,
+    missingBasis: openPositions.filter((row) => row.price !== null && row.basis === null).length,
+    pnlLots: openPositions.filter((row) => row.pnl !== null).length };
+  const incomplete = valuation.priced < valuation.total;
   return {
     total, invested, cash, pnl, pnlPercent: percentage(pnl, pnlBasis) ?? 0, cashPercent,
-    rows, allocation, largest, incomplete,
+    rows, allocation, largest, incomplete, valuation,
   };
 }
 

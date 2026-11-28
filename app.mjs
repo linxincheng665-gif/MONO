@@ -1,4 +1,5 @@
-import { seedState, loadState, saveState, quoteFor, portfolioSummary, parseHistory, indicators, tradePlan, stressTest, portfolioHistory } from './model.mjs';
+import { seedState, loadState, saveState, createWorkspaceBackup, readWorkspaceBackup, restoreWorkspaceBackup, workspaceBackupLimit,
+  quoteFor, portfolioSummary, parseHistory, indicators, tradePlan, stressTest, portfolioHistory } from './model.mjs';
 import { renderWorkspace, renderTradeResult, renderRiskKpis, renderRiskResult, renderResearchResult, renderMarketQuote, renderWatchQuote, renderDailyIndicators, renderQuantResult, renderOpportunities, renderMarketPulse } from './views.mjs';
 import { createAlpacaFeed, createFeed, validateAlpaca, validateFeed } from './feed.mjs';
 import { createPublicStockFeed, fetchPublicQuoteSnapshot } from './public-stock-feed.mjs';
@@ -7,12 +8,12 @@ import { createTrendStore, aggregateBars, mergeSeries, portfolioObserved } from 
 import { fetchStockHistory, stockHistoryIntervals } from './stock-history.mjs';
 import { renderMarketChart } from './market-chart.mjs';
 import { createChartNavigation } from './chart-navigation.mjs';
-import { runInvestmentResearch } from './investment-engine.mjs';
+import { researchQuoteStatus, runInvestmentResearch } from './investment-engine.mjs';
 import { loadResearchData, normalizeResearchEvidence, validateResearchEndpoint } from './research-data.mjs';
 import { buildRiskLab, diagnosePortfolio, evaluateAllocation, evaluateResearchAlerts, recordStrategy, strategyKey, trackedExitReviewAt, STRATEGY_LIMIT } from './workspace-analysis.mjs';
 import { runQuantLab } from './quant-lab.mjs';
 import { validateModelGateway, requestModelReview } from './model-gateway.mjs';
-import { applyOpportunityPlan, candidateFor, defaultOpportunityPlan, discoverUniverse, maxCustomTickers,
+import { applyOpportunityPlan, candidateFor, discoverUniverse, maxCustomTickers,
   normalizeOpportunityPlan, opportunityFor, pulseInstruments, summarizeMarket } from './market-research.mjs';
 
 const root = document.querySelector('#app');
@@ -91,7 +92,9 @@ const signedPercent = (value) => Number.isFinite(value) ? `${value >= 0 ? '+' : 
 const number = (value) => Number.isFinite(value) ? decimal.format(value) : '—';
 const tone = (value) => value == null || value === 0 ? '' : value < 0 ? 'bad' : 'good';
 
-let state = loadState();
+let workspaceStorageProblem = null;
+let workspaceSaveFailed = false;
+let state = loadState(undefined, (problem) => { workspaceStorageProblem = problem; });
 state.strategyJournal = Object.fromEntries(Object.entries(state.strategyJournal ?? {}).filter(([, value]) => Array.isArray(value?.versions)));
 state.researchAlerts = Array.isArray(state.researchAlerts) ? state.researchAlerts.filter((item) => item?.symbol && item.type) : [];
 state.overviewDismissals = Array.isArray(state.overviewDismissals) ? state.overviewDismissals.filter((id) => typeof id === 'string') : [];
@@ -108,9 +111,10 @@ let researchEndpoint = null;
 try { researchEndpoint = validateResearchEndpoint(state.researchEndpoint); } catch { /* an obsolete endpoint needs reconfiguration */ }
 let strategyReviewTimer;
 let opportunityScan = null;
+let defaultPlan = normalizeOpportunityPlan({ market: state.opportunityDefaultFilters?.market, horizon: state.opportunityDefaultFilters?.horizon });
 let customOpportunityPlan = state.opportunityPlan ? normalizeOpportunityPlan(state.opportunityPlan) : null;
 let opportunityMode = state.opportunityMode === 'custom' && customOpportunityPlan ? 'custom' : 'default';
-let opportunityPlan = opportunityMode === 'custom' ? customOpportunityPlan : defaultOpportunityPlan;
+let opportunityPlan = opportunityMode === 'custom' ? customOpportunityPlan : defaultPlan;
 let opportunityView = 'all';
 let opportunityVisibleRows = 14;
 let discoveredSymbol = '';
@@ -233,11 +237,13 @@ function extendedQuotesFor(ticker) {
 }
 function updateQuotes(quotes, isPublic = false) {
   const store = isPublic ? state.publicQuotes : state.liveQuotes;
+  const markTimeLimit = Date.now() + 60_000;
+  const validTime = (value) => Date.parse(value) <= markTimeLimit;
   for (const { symbol: ticker, ...quote } of quotes) {
     if (quote.currency && quote.currency !== instrumentCurrency(ticker)) continue;
     if (quote.session) {
       const time = Date.parse(quote.date);
-      if (instrumentMarket(ticker) !== 'US' || !Number.isFinite(time) || time > Date.now() + 60_000 ||
+      if (instrumentMarket(ticker) !== 'US' || !Number.isFinite(time) || time > markTimeLimit ||
           !Number.isFinite(quote.price) || quote.price <= 0) continue;
       const extended = isPublic ? publicExtendedQuotes : liveExtendedQuotes;
       const key = ticker + '|' + quote.session;
@@ -249,8 +255,8 @@ function updateQuotes(quotes, isPublic = false) {
       continue;
     }
     const current = store[ticker];
-    const mark = quote.date && (!current?.date || current.date <= quote.date);
-    const book = quote.bookDate && (!current?.bookDate || current.bookDate <= quote.bookDate);
+    const mark = validTime(quote.date) && Number.isFinite(quote.price) && quote.price > 0 && (!current?.date || current.date <= quote.date);
+    const book = validTime(quote.bookDate) && (!current?.bookDate || current.bookDate <= quote.bookDate);
     const priceChanged = mark && (current?.date !== quote.date || current.price !== quote.price || current.change !== quote.change);
     const bookChanged = book && (current?.bookDate !== quote.bookDate || current.bid !== quote.bid || current.ask !== quote.ask);
     const valuationChanged = isPublic && mark && JSON.stringify(current?.valuation ?? null) !== JSON.stringify(quote.valuation ?? null);
@@ -486,8 +492,8 @@ function buildContext() {
   const marketPulse = page === 'market' ? summarizeMarket({ market: instrumentMarket(symbol), selected: symbol,
     selectedQuote: quote, quoteFor: (ticker) => quoteFor(state, ticker), evidence }) : null;
   const newsContext = (evidence.events ?? []).filter((item) => item.kind === 'news');
-  const allocationCandidates = page === 'risk' && diagnostics && opportunityScan?.results
-    ? opportunityScan.results.filter((item) => item.match === true && instrumentCurrency(item.ticker) === portfolioCurrency) : [];
+  const allocationCandidates = page === 'risk' && riskTab === 'diagnosis' && diagnostics
+    ? recheckAllocationCandidates(opportunityScan, portfolioCurrency) : [];
   const alternative = allocationCandidates.length ? evaluateAllocation(summary, {
     ...Object.fromEntries(allocationCandidates.map((item) => [item.ticker, dailyHistory(item.ticker).bars])),
     ...portfolioWithHistory.histories,
@@ -580,7 +586,7 @@ async function refreshResearchEvidence(ticker, force, request) {
           delete state.researchEvidence[ticker].loading;
           const keys = Object.keys(state.researchEvidence).filter((key) => key !== ticker);
           for (const key of keys.slice(0, Math.max(0, keys.length - 24))) delete state.researchEvidence[key];
-          saveState(undefined, state);
+          writeWorkspace();
         }
       } else state.researchEvidence[ticker] = { ...state.researchEvidence[ticker], errors: evidence.errors, coverage: evidence.coverage };
     }
@@ -588,7 +594,9 @@ async function refreshResearchEvidence(ticker, force, request) {
     if (researchRequests.get(ticker) === request && !state.researchEvidence[ticker]) state.researchEvidence[ticker] = { errors: [{ message: '研究数据暂无法获取' }] };
   } finally {
     request.loading = false;
-    if (['research', 'market'].includes(page) && ticker === symbol) updateResults();
+    if (['research', 'market'].includes(page) && ticker === symbol ||
+        page === 'risk' && riskTab === 'diagnosis' && !dialog.open &&
+        opportunityScan?.results.some((item) => item.match === true && item.ticker === ticker)) updateResults();
     queueStrategyReview();
   }
 }
@@ -623,7 +631,7 @@ function reviewStrategies() {
     announce(`${fired[0].symbol} · ${alertNames[fired[0].type]}${fired.length > 1 ? `等 ${fired.length} 条提醒` : ''}`);
   }
   if (changed || fired.length) {
-    saveState(undefined, state);
+    writeWorkspace();
     if (page === 'research') updateResults();
     if (page === 'overview') refreshOverview();
   }
@@ -750,7 +758,7 @@ function overviewFocus(portfolio, summary) {
       (summary.incomplete && !id.startsWith(`${prefix}valuation|`)));
     if (remaining.length !== state.overviewDismissals.length) {
       state.overviewDismissals = remaining;
-      saveState(undefined, state);
+      writeWorkspace();
     }
   }
   const dismissed = new Set(state.overviewDismissals);
@@ -861,7 +869,7 @@ function renderShell() {
     <aside class="sidebar" id="mobile-drawer" aria-label="工作空间菜单">
       <div class="drawer-head"><a class="brand" href="#overview" aria-label="MONO 首页"><span>MONO</span><i aria-hidden="true"></i><img class="workspace-monogram" src="mono-icon.svg" alt="" width="32" height="32"></a><button class="icon-button" data-action="close-menu" aria-label="关闭导航">${icons('close', 19)}</button></div>
       <nav aria-label="主导航">${nav}</nav>
-      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.4</span></div>
+      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.5</span></div>
     </aside>
     <header class="topbar"><div class="topbar-content">
       <div class="topbar-brand">
@@ -893,7 +901,9 @@ function renderContent() {
   const content = root.querySelector('#main-content');
   content.toggleAttribute('data-empty-portfolio', page === 'overview' && !ctx.portfolio.holdings.length && ctx.portfolio.cash === 0);
   content.toggleAttribute('data-empty-watchlist', page === 'overview' && !state.watchlist.length);
-  content.innerHTML = renderMobileGroup() + (page === 'overview' ? overview(ctx) : renderWorkspace(page, ctx));
+  content.innerHTML = renderMobileGroup() + '<p id="workspace-storage-status" class="workspace-storage-status" role="status" hidden><span></span><button class="link-button" data-action="workspace-backup" type="button">备份与恢复</button></p>'
+    + (page === 'overview' ? overview(ctx) : renderWorkspace(page, ctx));
+  updateWorkspaceStatus();
   if (page === 'opportunities' && !opportunityScan) queueMicrotask(() => {
     if (page === 'opportunities' && !opportunityScan) void scanOpportunities();
   });
@@ -996,8 +1006,24 @@ function announce(message) {
   toastTimer = setTimeout(() => { toast.hidden = true; }, 3700);
 }
 
+function updateWorkspaceStatus() {
+  const notice = root.querySelector('#workspace-storage-status');
+  if (!notice) return;
+  const detail = workspaceStorageProblem === 'damaged' ? '本机工作区读取失败。原有存档已保留。'
+    : workspaceStorageProblem === 'unavailable' ? '本机工作区存储暂不可用。'
+      : workspaceSaveFailed ? '最新修改尚未保存到本机，可先导出备份。' : '';
+  notice.hidden = !detail;
+  notice.querySelector('span').textContent = detail;
+}
+
+function writeWorkspace() {
+  workspaceSaveFailed = !saveState(undefined, state);
+  updateWorkspaceStatus();
+  return !workspaceSaveFailed;
+}
+
 function persist(message) {
-  const saved = saveState(undefined, state);
+  const saved = writeWorkspace();
   queueStrategyReview();
   updateFeedChip();
   if (!saved) announce('当前浏览器无法保存本地数据。本次修改在当前会话仍可用。');
@@ -1263,7 +1289,54 @@ function settings() {
     state.pricePalette = data.palette === 'cn' ? 'cn' : 'us';
     root.querySelector('.shell').dataset.marketPalette = state.pricePalette;
     persist('显示设置已保存');
-  }, { description: state.demo ? '当前工作区含预置的演示持仓与报价。可保留已录入的数据，只移除预置示例。' : '持仓、自选、研究记录和交易计划均保存在本机。', extra: `<button type="button" class="button" data-action="set-cash">设置现金</button><button type="button" class="button" data-action="market-feed">行情连接</button>${state.demo ? '<button type="button" class="button" data-action="clear-demo">移除演示数据</button>' : ''}` });
+  }, { description: state.demo ? '当前工作区含预置的演示持仓与报价。可保留已录入的数据，只移除预置示例。' : '持仓、自选、研究记录和交易计划均保存在本机。', extra: `<button type="button" class="button" data-action="set-cash">设置现金</button><button type="button" class="button" data-action="market-feed">行情连接</button><button type="button" class="button" data-action="workspace-backup">备份与恢复</button>${state.demo ? '<button type="button" class="button" data-action="clear-demo">移除演示数据</button>' : ''}` });
+}
+
+const exportBackupButton = '<button type="button" class="button" data-action="export-workspace">导出当前备份</button>';
+const restoredWorkspaceFlag = 'mono-workspace-restored';
+
+function exportWorkspace() {
+  try {
+    const json = createWorkspaceBackup(state);
+    const filename = `MONO-backup-${new Date().toLocaleDateString('sv-SE')}.json`;
+    if (globalThis.MonoWorkspace?.saveBackup) {
+      if (!globalThis.MonoWorkspace.saveBackup(filename, json)) announce('暂时无法打开保存窗口，请稍后重试。');
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([json], { type: 'application/json' }));
+    const link = Object.assign(document.createElement('a'), { href: url, download: filename });
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30_000);
+    announce('已发起备份下载。');
+  } catch (error) {
+    announce(error.message || '无法生成工作区备份。');
+  }
+}
+
+function workspaceBackupDialog() {
+  openDialog('备份与恢复', field('file', '选择工作区备份', '', 'type="file" accept=".json,application/json" required'),
+    async (_data, form) => {
+      const file = form.elements.file.files[0];
+      if (!file?.size || file.size > workspaceBackupLimit) throw new Error('请选择 5 MB 以内的非空 MONO JSON 备份。');
+      const backup = readWorkspaceBackup(await file.text());
+      if (!dialog.open || !form.isConnected) return;
+      const imported = backup.workspace;
+      const date = new Date(backup.createdAt).toLocaleString('zh-CN', { hour12: false });
+      openDialog('确认恢复工作区', '', () => {
+        const restored = restoreWorkspaceBackup(state, backup);
+        if (!restored) throw new Error('备份无法写入本机。当前工作区未被替换。');
+        stopOpportunityScan();
+        clearTimeout(strategyReviewTimer);
+        researchRequests.clear();
+        externalRequest?.abort();
+        state = restored;
+        try { sessionStorage.setItem(restoredWorkspaceFlag, '1'); } catch { /* the stored workspace can still be reloaded */ }
+        location.reload();
+      }, { description: `${esc(date)} 的备份含 ${imported.holdings.length} 条持仓、${imported.watchlist.length} 项自选、${imported.trades.length} 份交易计划。恢复会替换当前工作区数据，并保留本机的行情连接和密钥。`,
+        submit: '恢复并替换', extra: exportBackupButton });
+    }, { description: '备份含持仓、历史行情、自选、研究及计划等本机数据。行情连接和密钥留在当前设备。', submit: '预览恢复', extra: exportBackupButton });
 }
 
 function setOverviewFocus(open) {
@@ -1509,11 +1582,25 @@ function scanCandidates(plan = opportunityPlan) {
   return discoverUniverse(plan.market, { scope: plan.scope, personal: [...state.watchlist, ...state.holdings], symbols: plan.symbols });
 }
 
+function recheckAllocationCandidates(scan, currency) {
+  if (scan?.stage !== 'complete') return [];
+  const now = Date.now();
+  return scan.results.filter((item) => item.match === true && instrumentCurrency(item.ticker) === currency
+      && researchQuoteStatus(quoteFor(state, item.ticker), currency, now).quoteStatus === 'fresh')
+    .sort((a, b) => Number(b.status === 'opportunity') - Number(a.status === 'opportunity') ||
+      (b.ratio ?? 0) - (a.ratio ?? 0) || a.ticker.localeCompare(b.ticker))
+    .slice(0, 8).map((item) => {
+      const analysis = analyzeInstrument(item.ticker, scan.plan.horizon, item.type, true);
+      return applyOpportunityPlan(opportunityFor(item, analysis), scan.plan);
+    }).filter((item) => item.match === true && item.status === 'opportunity');
+}
+
 function stopOpportunityScan() {
   if (!opportunityScan?.running) return;
   opportunityScan.controller.abort();
   opportunityScan.running = false;
   opportunityScan.stage = 'stopped';
+  opportunityScan.stoppedAt = new Date().toISOString();
   if (page === 'opportunities') updateResults();
 }
 
@@ -1521,10 +1608,13 @@ function chooseOpportunityPlan(mode, changes) {
   stopOpportunityScan();
   opportunityScan = null;
   opportunityMode = mode;
-  opportunityPlan = normalizeOpportunityPlan({ ...(mode === 'custom' ? customOpportunityPlan : defaultOpportunityPlan), ...changes });
+  opportunityPlan = normalizeOpportunityPlan({ ...(mode === 'custom' ? customOpportunityPlan : defaultPlan), ...changes });
   if (mode === 'custom') {
     customOpportunityPlan = opportunityPlan;
     state.opportunityPlan = opportunityPlan;
+  } else {
+    defaultPlan = opportunityPlan;
+    state.opportunityDefaultFilters = { market: defaultPlan.market, horizon: defaultPlan.horizon };
   }
   opportunityView = 'all';
   opportunityVisibleRows = 14;
@@ -1557,7 +1647,7 @@ async function scanOpportunities() {
   if (opportunityScan?.running) return;
   const plan = opportunityPlan;
   const candidates = scanCandidates(plan);
-  const scan = { running: true, results: [], total: candidates.length, stage: 'prices', reviewed: 0, reviewTotal: 0, controller: new AbortController() };
+  const scan = { plan, running: true, results: [], total: candidates.length, stage: 'prices', reviewed: 0, reviewTotal: 0, controller: new AbortController() };
   opportunityScan = scan;
   opportunityVisibleRows = 14;
   const { signal } = scan.controller;
@@ -1723,7 +1813,7 @@ root.addEventListener('click', (event) => {
       }
     }, 'research-symbol': () => navigate('research'),
     'trade-symbol': () => { tradeInputs = { ...initialTrade(symbol), entry: quoteFor(state, symbol).source !== 'demo' ? quoteFor(state, symbol).price ?? '' : '' }; navigate('trades'); },
-    'market-feed': marketFeedSettings, 'import-history': importHistory, settings,
+    'market-feed': marketFeedSettings, 'import-history': importHistory, settings, 'workspace-backup': workspaceBackupDialog,
     'toggle-currency': () => {
       setPortfolioCurrency(portfolioCurrency === 'USD' ? 'CNY' : 'USD');
       persist();
@@ -1857,6 +1947,8 @@ dialog.addEventListener('click', (event) => {
   if (action === 'refresh-public') { void publicFeed.refresh({ forceExtended: true }); dialog.close(); }
   if (action === 'disconnect-feed') disconnectFeed();
   if (action === 'clear-demo') clearDemo();
+  if (action === 'workspace-backup') workspaceBackupDialog();
+  if (action === 'export-workspace') exportWorkspace();
   if (action === 'chart-period') {
     if (!chartExpanded) dialog.close();
     selectChartPeriod(control.dataset.period);
@@ -1876,6 +1968,7 @@ dialog.addEventListener('submit', async (event) => {
   warning.hidden = true;
   try {
     await dialogSubmit(Object.fromEntries(new FormData(form)), form);
+    if (!dialog.open || !form.isConnected) return;
     dialog.close();
     const opener = document.activeElement;
     renderContent();
@@ -1987,13 +2080,13 @@ window.addEventListener('resize', () => {
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) return;
   ensurePageHistory();
-  if (page === 'research' && !dialog.open) updateResults();
+  if (!dialog.open && (page === 'research' || page === 'risk' && riskTab === 'diagnosis' && opportunityScan?.stage === 'complete')) updateResults();
   queueStrategyReview();
 });
 setInterval(() => {
   if (document.hidden) return;
   ensurePageHistory();
-  if (page === 'research' && !dialog.open) updateResults();
+  if (!dialog.open && (page === 'research' || page === 'risk' && riskTab === 'diagnosis' && opportunityScan?.stage === 'complete')) updateResults();
   if (page !== 'research' && Object.values(state.strategyJournal).some((item) => !item.paused)) {
     const refresh = Object.values(state.strategyJournal).find((item) => !item.paused && !researchRequests.get(item.symbol)?.loading &&
       Date.now() - (researchRequests.get(item.symbol)?.at ?? 0) >= 30 * 60_000);
@@ -2010,3 +2103,13 @@ desktopWidth.addEventListener('change', (event) => {
 renderShell();
 activateFeed();
 queueStrategyReview();
+window.addEventListener('mono-backup-saved', ({ detail }) => {
+  if (detail === 'saved') announce('工作区备份已保存。');
+  if (detail === 'error') announce('备份写入失败，请换一个位置重试。');
+});
+try {
+  if (sessionStorage.getItem(restoredWorkspaceFlag)) {
+    sessionStorage.removeItem(restoredWorkspaceFlag);
+    announce('已恢复工作区。');
+  }
+} catch { /* restore does not require session storage */ }

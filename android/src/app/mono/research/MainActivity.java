@@ -11,6 +11,7 @@ import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebResourceRequest;
@@ -25,16 +26,22 @@ import android.window.OnBackInvokedDispatcher;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 public final class MainActivity extends Activity {
     private static final String HOST = "mono.android.local";
     private static final String BASE_URL = "https://" + HOST;
     private static final String START_PAGE = BASE_URL + "/index.html";
     private static final int OPEN_HISTORY = 1;
+    private static final int SAVE_BACKUP = 2;
+    private static final int MAX_BACKUP_BYTES = 5 * 1024 * 1024;
+    private static final Pattern BACKUP_FILENAME = Pattern.compile("[A-Za-z0-9][A-Za-z0-9._-]{0,89}\\.json");
     private static final String[] HISTORY_MIME_TYPES = {
         "text/csv", "text/tab-separated-values", "text/plain",
         "application/csv", "application/x-csv", "application/vnd.ms-excel",
@@ -97,6 +104,8 @@ public final class MainActivity extends Activity {
 
     private WebView webView;
     private ValueCallback<Uri[]> selectedFiles;
+    private final AtomicBoolean savingBackup = new AtomicBoolean();
+    private byte[] pendingBackup;
     private Runnable unregisterBack;
     private boolean backPending;
 
@@ -168,6 +177,7 @@ public final class MainActivity extends Activity {
         WebView.setWebContentsDebuggingEnabled(false);
         webView.setWebViewClient(new LocalClient());
         webView.addJavascriptInterface(new AlpacaCredentialVault(this), "MonoNative");
+        webView.addJavascriptInterface(new WorkspaceFiles(), "MonoWorkspace");
         webView.setWebChromeClient(new WebChromeClient() {
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
@@ -183,7 +193,7 @@ public final class MainActivity extends Activity {
                 open.putExtra(Intent.EXTRA_MIME_TYPES, HISTORY_MIME_TYPES);
                 open.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
                 try {
-                    startActivityForResult(Intent.createChooser(open, getString(R.string.choose_history)), OPEN_HISTORY);
+                    startActivityForResult(Intent.createChooser(open, getString(R.string.choose_data_file)), OPEN_HISTORY);
                 } catch (ActivityNotFoundException error) {
                     finishFileSelection(null);
                     Toast.makeText(MainActivity.this, R.string.chooser_unavailable, Toast.LENGTH_LONG).show();
@@ -191,6 +201,80 @@ public final class MainActivity extends Activity {
                 return true;
             }
         });
+    }
+
+    public final class WorkspaceFiles {
+        @JavascriptInterface
+        public boolean saveBackup(String filename, String json) {
+            if (filename == null || !BACKUP_FILENAME.matcher(filename).matches() || json == null
+                    || json.isEmpty() || json.length() > MAX_BACKUP_BYTES
+                    || !savingBackup.compareAndSet(false, true)) return false;
+            final byte[] contents = json.getBytes(StandardCharsets.UTF_8);
+            if (contents.length > MAX_BACKUP_BYTES) {
+                savingBackup.set(false);
+                return false;
+            }
+            runOnUiThread(() -> chooseBackupDestination(filename, contents));
+            return true;
+        }
+    }
+
+    private boolean isWorkspacePageActive() {
+        String url = webView == null ? null : webView.getUrl();
+        return !isFinishing() && !isDestroyed() && url != null && isAppPage(Uri.parse(url));
+    }
+
+    private void chooseBackupDestination(String filename, byte[] contents) {
+        if (!isWorkspacePageActive() || selectedFiles != null) {
+            finishBackup("error");
+            return;
+        }
+        pendingBackup = contents;
+        Intent create = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+        create.addCategory(Intent.CATEGORY_OPENABLE);
+        create.setType("application/json");
+        create.putExtra(Intent.EXTRA_TITLE, filename);
+        create.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+        try {
+            startActivityForResult(create, SAVE_BACKUP);
+        } catch (ActivityNotFoundException | SecurityException error) {
+            finishBackup("error");
+        }
+    }
+
+    private void backupDestinationChosen(int resultCode, Intent data) {
+        byte[] contents = pendingBackup;
+        pendingBackup = null;
+        if (contents == null) return;
+        if (resultCode != RESULT_OK) {
+            finishBackup("cancelled");
+            return;
+        }
+        Uri destination = data == null ? null : data.getData();
+        if (destination == null || !"content".equals(destination.getScheme()) || destination.getAuthority() == null) {
+            finishBackup("error");
+            return;
+        }
+        new Thread(() -> {
+            String result = "saved";
+            try (OutputStream output = getContentResolver().openOutputStream(destination, "w")) {
+                if (output == null) throw new IOException("Backup destination is unavailable");
+                output.write(contents);
+            } catch (IOException | SecurityException | IllegalArgumentException error) {
+                result = "error";
+            }
+            final String completion = result;
+            runOnUiThread(() -> finishBackup(completion));
+        }, "mono-workspace-backup").start();
+    }
+
+    private void finishBackup(String result) {
+        pendingBackup = null;
+        savingBackup.set(false);
+        if (isWorkspacePageActive()) {
+            webView.evaluateJavascript(
+                "window.dispatchEvent(new CustomEvent('mono-backup-saved',{detail:'" + result + "'}))", null);
+        }
     }
 
     private static boolean isAppOrigin(Uri uri) {
@@ -274,6 +358,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == SAVE_BACKUP) {
+            backupDestinationChosen(resultCode, data);
+            return;
+        }
         if (requestCode != OPEN_HISTORY) return;
         Uri result = resultCode == RESULT_OK && data != null ? data.getData() : null;
         finishFileSelection(result != null && "content".equals(result.getScheme()) ? new Uri[]{result} : null);
@@ -334,8 +422,10 @@ public final class MainActivity extends Activity {
     protected void onDestroy() {
         if (unregisterBack != null) unregisterBack.run();
         finishFileSelection(null);
+        pendingBackup = null;
         if (webView != null) {
             webView.removeJavascriptInterface("MonoNative");
+            webView.removeJavascriptInterface("MonoWorkspace");
             ((FrameLayout) webView.getParent()).removeView(webView);
             webView.destroy();
             webView = null;
