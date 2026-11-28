@@ -65,8 +65,9 @@ function emptyResult(symbol, now) {
   return { symbol, fetchedAt: new Date(now).toISOString(), macro: [], fundamentals: [], valuation: [], events: [], sentiment: [], errors: [], coverage: [] };
 }
 
-function evidence(label, value, { unit = '', asOf = null, publishedAt = null, source, url, detail = '', metric, kind }) {
-  return { label, value, unit, asOf, publishedAt, source, url, detail, ...(metric ? { metric } : {}), ...(kind ? { kind } : {}) };
+function evidence(label, value, { unit = '', asOf = null, publishedAt = null, source, url, detail = '', metric, kind, scope }) {
+  return { label, value, unit, asOf, publishedAt, source, url, detail, ...(metric ? { metric } : {}), ...(kind ? { kind } : {}),
+    ...(scope ? { scope } : {}) };
 }
 
 export function validateResearchEndpoint(value) {
@@ -110,10 +111,11 @@ export function normalizeResearchEvidence(symbol, payload, now = Date.now()) {
         omitted++;
         continue;
       }
+      const kind = evidenceKinds[section]?.has(item.kind) ? item.kind : undefined;
       output[section].push(evidence(label, value === '' ? null : value, {
         unit: cleanText(item.unit, 24), asOf, publishedAt, source, url: url.href, detail: cleanText(item.detail, 700),
         metric: metricSections[section]?.has(item.metric) ? item.metric : undefined,
-        kind: evidenceKinds[section]?.has(item.kind) ? item.kind : undefined,
+        kind, scope: kind === 'filing' && item.scope === 'registrant' ? 'registrant' : undefined,
       }));
     }
   }
@@ -224,6 +226,7 @@ export function parseSecEvents(payload, cik, { fund = false, multipleSeries = fa
       source: 'SEC EDGAR', url, asOf: dateValue(recent.reportDate?.[index]) ?? filed,
       publishedAt: dateValue(recent.acceptanceDateTime?.[index]) ?? filed,
       detail: multipleSeries ? '同一注册人可能申报多个基金系列，查阅原文核对所选基金。' : items ? '申报事项编号 ' + items : '', kind: 'filing',
+      scope: multipleSeries ? 'registrant' : undefined,
     }));
   }
   return output;

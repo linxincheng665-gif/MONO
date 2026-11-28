@@ -1,12 +1,14 @@
 import { buyQuantityRules, instrumentCurrency, instrumentMarket } from './instruments.mjs';
-import { researchQuoteStatus } from './investment-engine.mjs';
+import { dailySampleIssue, hasPriceHistoryJump, researchQuoteStatus } from './investment-engine.mjs';
 import { tradePlan } from './model.mjs';
 
 const finite = Number.isFinite;
 export const STRATEGY_LIMIT = 12;
 const MAX_HISTORY = 24;
 const MAX_ALERTS = 40;
-const maxHistoryGap = 14 * 86_400_000;
+const dayMs = 86_400_000;
+const maxHistoryGap = 14 * dayMs;
+const minHistoryDays = 41;
 const historyClocks = {
   CN: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }),
   US: new Intl.DateTimeFormat('en-CA', { timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23' }),
@@ -23,7 +25,7 @@ function historyCutoff(symbol, now) {
 function dateCloses(history, { day, closed }) {
   return new Map((history ?? []).filter(({ date, close, complete }) => /^\d{4}-\d{2}-\d{2}$/.test(date)
     && (date < day || date === day && closed) && complete !== false && finite(close) && close > 0)
-    .map(({ date, close }) => [date, close]));
+    .map(({ date, close, open }) => [date, { close, open: finite(open) && open > 0 ? open : close }]));
 }
 
 function aligned(maps, reference = new Map()) {
@@ -40,7 +42,36 @@ function aligned(maps, reference = new Map()) {
 }
 
 function returns(closes, days) {
-  return days.slice(1).map((day, index) => closes.get(day) / closes.get(days[index]) - 1);
+  return days.slice(1).map((day, index) => closes.get(day).close / closes.get(days[index]).close - 1);
+}
+
+function comparisonSample(maps, reference, from = '') {
+  const shared = aligned(maps, reference).filter((date) => date >= from);
+  let start = 0;
+  for (let index = shared.length - 1; index > 0; index -= 1) {
+    const previous = shared[index - 1], day = shared[index];
+    if (maps.some((prices) => hasPriceHistoryJump(prices.get(previous).close, prices.get(day).open))) {
+      start = index;
+      break;
+    }
+  }
+  const splitDate = start ? shared[start] : null;
+  const dates = shared.slice(start);
+  const issue = dailySampleIssue(dates);
+  const reason = issue ? '共同记录频率偏低，需更连续的日线才能比较波动与回撤。'
+    : splitDate && dates.length < minHistoryDays ? `${splitDate} 出现异常价格跳变。跳变后还需至少 40 段共同日线收益，或补充同口径日线。` : '';
+  return { days: issue ? [] : dates, splitDate, reason };
+}
+
+function staleSample(lastDate, cutoff) {
+  return Date.parse(cutoff.day) - Date.parse(lastDate) > 7 * dayMs;
+}
+
+function replayNote(splitDate, lastDate, cutoff) {
+  return [
+    ...(splitDate ? [`${splitDate} 出现异常价格跳变，回放自该日收盘重新起算。`] : []),
+    ...(staleSample(lastDate, cutoff) ? ['末根共同日线距当前已超过 7 个自然日，结果反映上列历史区间。'] : []),
+  ].join(' ');
 }
 
 function covariance(left, right) {
@@ -92,8 +123,8 @@ export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, m
   const reviewed = exposures.slice(0, 16);
   for (const [i, left] of reviewed.entries()) {
     for (const right of reviewed.slice(i + 1)) {
-      const days = aligned([left.closes, right.closes]);
-      if (days.length < 41) continue;
+      const { days } = comparisonSample([left.closes, right.closes]);
+      if (days.length < minHistoryDays) continue;
       const a = returns(left.closes, days);
       const b = returns(right.closes, days);
       const denom = Math.sqrt(covariance(a, a) * covariance(b, b));
@@ -114,19 +145,21 @@ export function diagnosePortfolio(summary, histories, { cap = 25, shock = -20, m
     paired: riskPairs[0] ? total * riskPairs[0].exposure / 100 * shock / 100 : null,
     after: rebalance ? (exposureValue - rebalance.value) * shock / 100 : null,
     recovery: exposureValue * .10, recoveryAfter: rebalance ? (exposureValue - rebalance.value) * .10 : null };
-  const days = !incomplete && exposures.length <= 16 ? aligned(exposures.map(({ closes }) => closes)) : [];
+  const sample = !incomplete && exposures.length <= 16 ? comparisonSample(exposures.map(({ closes }) => closes)) : null;
+  const days = sample?.days ?? [];
   let history = null;
-  if (days.length >= 41) {
+  if (days.length >= minHistoryDays) {
     const series = exposures.map(({ closes }) => returns(closes, days));
     const weights = exposures.map(({ weight }) => weight / 100);
     const next = [...weights];
     if (rebalance) next[0] = capPercent / 100;
-    history = { from: days[0], through: days.at(-1), observations: days.length - 1,
+    history = { from: days[0], through: days.at(-1), observations: days.length - 1, note: replayNote(sample.splitDate, days.at(-1), cutoff),
       before: historicalStats(series, weights), after: rebalance ? historicalStats(series, next) : null };
   }
   return { incomplete, cap: capPercent, cashPct, reserve: reservePercent, deployable: incomplete ? null : Math.max(0, cash - total * reservePercent / 100),
     largest: largest?.symbol, over: over.length, pairs: riskPairs.slice(0, 3), pairedCoverage: reviewed.length,
-    usablePairs, possiblePairs: reviewed.length * (reviewed.length - 1) / 2, holdings: exposures.length, rebalance, scenario, history };
+    usablePairs, possiblePairs: reviewed.length * (reviewed.length - 1) / 2, holdings: exposures.length, rebalance, scenario, history,
+    historyReason: sample?.reason };
 }
 
 function pct(value, total) {
@@ -192,25 +225,27 @@ function stressFor(positions, total, marketShock, specificSymbol, specificShock)
 }
 
 function replayHistory(positions, histories, cutoff, total, updated, benchmarkBars) {
-  if (!positions.length || positions.length > 16) return null;
+  if (!positions.length || positions.length > 16) return { history: null };
   const closes = positions.map(({ symbol }) => dateCloses(histories[symbol], cutoff));
   const benchmark = dateCloses(benchmarkBars, cutoff);
-  const days = aligned(closes, benchmark);
-  if (days.length < 41) return null;
+  const { days, splitDate, reason } = comparisonSample(closes, benchmark);
+  if (days.length < minHistoryDays) return { history: null, historyReason: reason };
   const series = closes.map((map) => returns(map, days));
   const weights = positions.map(({ value }) => value / total);
   const before = historicalStats(series, weights);
   const after = updated ? historicalStats(series, updated.map(({ value }) => value / total)) : null;
-  const matched = aligned([...closes, benchmark]);
+  const { days: matched } = comparisonSample([...closes, benchmark], undefined, days[0]);
   let reference = null;
-  if (matched.length >= 41) {
+  if (matched.length >= minHistoryDays) {
     const index = returns(benchmark, matched);
     const indexVariance = covariance(index, index);
     const moves = closes.map((map) => returns(map, matched));
     const beta = (allocations) => indexVariance > 0 ? allocations.reduce((sum, weight, i) => sum + weight * covariance(moves[i], index), 0) / indexVariance : null;
-    reference = { observations: matched.length - 1, before: beta(weights), after: updated ? beta(updated.map(({ value }) => value / total)) : null };
+    reference = { from: matched[0], through: matched.at(-1), observations: matched.length - 1,
+      before: beta(weights), after: updated ? beta(updated.map(({ value }) => value / total)) : null };
   }
-  return { from: days[0], through: days.at(-1), observations: days.length - 1, before, after, reference };
+  return { history: { from: days[0], through: days.at(-1), observations: days.length - 1, before, after, reference,
+    note: replayNote(splitDate, days.at(-1), cutoff) } };
 }
 
 function simulateWeight(positions, histories, benchmarkBars, cutoff, { total, cash, incomplete }, options) {
@@ -257,9 +292,9 @@ function simulateWeight(positions, histories, benchmarkBars, cutoff, { total, ca
     return { cash: balance, cashPercent, weight: items.find((item) => item.symbol === symbol).weight,
       maximumWeight: largest?.weight ?? 0, stressPnl: pnl, hhi, effectiveHoldings };
   };
-  const history = replayHistory(positions, histories, cutoff, total, updated, benchmarkBars);
   return { ...base, status: 'ready', order, limits, limitedBy, cap, reserve, minimum: quantity?.minimum ?? null,
-    before: snapshot(positions, cash), after: snapshot(updated, nextCash), history };
+    before: snapshot(positions, cash), after: snapshot(updated, nextCash),
+    ...replayHistory(positions, histories, cutoff, total, updated, benchmarkBars) };
 }
 
 export function buildRiskLab(summary, histories = {}, {
@@ -278,8 +313,9 @@ export function buildRiskLab(summary, histories = {}, {
   const cutoff = historyCutoff(positions[0]?.symbol, now);
   const trial = simulateWeight(positions, histories, benchmarkBars, cutoff, { total, cash, incomplete },
     { cap: capPercent, reserve, stress, draft: simulation });
-  const history = !incomplete ? trial.history ?? replayHistory(positions, histories, cutoff, total, null, benchmarkBars) : null;
-  return { status: incomplete ? 'partial' : total > 0 ? 'ready' : 'empty', incomplete, positions, concentration, stress, simulation: trial, history };
+  const replay = incomplete ? { history: null } : trial.status === 'ready' ? trial : replayHistory(positions, histories, cutoff, total, null, benchmarkBars);
+  return { status: incomplete ? 'partial' : total > 0 ? 'ready' : 'empty', incomplete, positions, concentration, stress, simulation: trial,
+    history: replay.history, historyReason: replay.historyReason };
 }
 
 export function evaluateAllocation(summary, histories, candidates, { cap = 25, maxCashTarget = 20, now = Date.now() } = {}) {
@@ -299,27 +335,28 @@ export function evaluateAllocation(summary, histories, candidates, { cap = 25, m
     const current = eligible.find(({ symbol }) => symbol === item.ticker);
     if (largest.symbol === item.ticker && trims > 0) continue;
     const maps = current ? currentMaps : [...currentMaps, dateCloses(histories[item.ticker], cutoff)];
-    const days = aligned(maps);
-    if (days.length < 41) continue;
+    const { days } = comparisonSample(maps);
+    if (days.length < minHistoryDays || staleSample(days.at(-1), cutoff)) continue;
     const plan = tradePlan({ symbol: item.ticker, entry: item.entry, target: item.target, stop: item.stop, riskPercent: 1,
       cash: cash + trims, equity: total, positionValue: current?.value ?? 0, capPercent: cap, reservePercent: maxCashTarget,
-      fractional: item.market === 'US' });
+      fractional: item.market === 'US', costBps: item.costBps, gapPercent: item.gapPercent });
     if (!plan.valid || plan.shares <= 0) continue;
     const { investment: amount, shares } = plan;
     const trimUsed = Math.min(trims, Math.max(0, amount + reserve - cash));
     const beforeWeights = eligible.map(({ value }) => value / total);
     if (!current) beforeWeights.push(0);
-    const afterWeights = [...beforeWeights];
+    const afterEquity = total - plan.entryCost;
+    const afterWeights = beforeWeights.map((weight) => weight * total / afterEquity);
     const addedIndex = current ? eligible.indexOf(current) : eligible.length;
-    afterWeights[addedIndex] += amount / total;
-    if (trimUsed > 0) afterWeights[eligible.findIndex(({ symbol }) => symbol === largest.symbol)] -= trimUsed / total;
+    afterWeights[addedIndex] += (amount - plan.entryCost) / afterEquity;
+    if (trimUsed > 0) afterWeights[eligible.findIndex(({ symbol }) => symbol === largest.symbol)] -= trimUsed / afterEquity;
     const series = maps.map((map) => returns(map, days));
     const before = historicalStats(series, beforeWeights);
     const after = historicalStats(series, afterWeights);
     views.push({ ticker: item.ticker, from: trimUsed > 0 ? largest.symbol : null, trimAmount: trimUsed,
       kind: trimUsed > 0 ? '部分替换' : '可用现金增配', amount, shares, nextWeight: afterWeights[addedIndex] * 100,
       beforeVol: before.volatility, afterVol: after.volatility, beforeDrawdown: before.drawdown, afterDrawdown: after.drawdown,
-      observations: days.length - 1, entry: item.entry, stop: item.stop, decision: item.status });
+      observations: days.length - 1, entry: item.entry, stop: item.stop, decision: item.status, entryCost: plan.entryCost });
   }
   // Prefer comparisons that lower both historical risk measures. Otherwise show no automatic alternative.
   return views.filter((item) => item.afterVol <= item.beforeVol && item.afterDrawdown <= item.beforeDrawdown)
@@ -339,21 +376,22 @@ export function trackedExitReviewAt(record) {
 }
 
 export function recordStrategy(record, analysis, now = Date.now()) {
-  const action = analysis.decision?.action ?? '继续观察';
-  const status = analysis.decision?.status ?? 'watch';
+  const horizon = analysis.horizons?.find(({ key }) => key === record.horizon);
+  const decision = analysis.horizon && analysis.horizon !== record.horizon ? horizon ?? analysis.decision : analysis.decision;
+  const action = decision?.action ?? '继续观察';
+  const status = decision?.status ?? 'watch';
   const prior = record.versions?.[0];
   const level = (value) => finite(value) ? value : null;
-  const horizon = analysis.horizons?.find(({ key }) => key === record.horizon);
   const marketLevels = horizon ?? (analysis.plan?.source === 'manual' ? {} : analysis);
   const at = new Date(now).toISOString();
-  const positionAction = analysis.decision?.positionAction ?? null;
+  const positionAction = decision?.positionAction ?? null;
   const previousExitReview = trackedExitReviewAt(record);
   const exitResolved = analysis.data?.quoteStatus === 'fresh' && status !== 'blocked' && finite(horizon?.support);
   const exitReviewSince = positionAction === 'review-exit' ? previousExitReview ?? at : exitResolved ? null : previousExitReview;
   const next = {
-    at, action, status, positionAction, reason: analysis.decision?.reason ?? analysis.summary,
+    at, action, status, positionAction, reason: decision?.reason ?? analysis.summary,
     entry: level(marketLevels.entry), target: level(marketLevels.target), stop: level(marketLevels.stop),
-    next: horizon?.trigger ?? analysis.decision?.next ?? analysis.decision?.reason,
+    next: decision?.next ?? horizon?.next ?? horizon?.trigger ?? decision?.reason,
     assessedOn: analysis.data?.lastBarDate ?? null,
   };
   const sameLevel = (key) => next[key] === prior?.[key] ||
@@ -373,25 +411,32 @@ export function evaluateResearchAlerts(alerts, { analysisFor, quoteFor, strategi
   const fired = [];
   const result = (alerts ?? []).slice(0, MAX_ALERTS).map((alert) => {
     if (alert.firedAt) return alert;
-    const quote = quoteFor(alert.symbol);
+    const timed = alert.type === 'event';
+    const quote = timed ? null : quoteFor(alert.symbol);
     const ts = Date.parse(quote?.date);
-    const onFeed = ['public', 'live'].includes(quote?.source) && finite(quote?.price) && ts <= now + 300_000 && now - ts < 86_400_000;
+    const createdAt = Date.parse(alert.createdAt);
+    const currency = instrumentCurrency(alert.symbol);
+    const onFeed = ['public', 'live'].includes(quote?.source) && finite(quote?.price) && quote.price > 0 &&
+      (!quote.currency || quote.currency === currency) && finite(ts) && finite(createdAt) && ts >= createdAt &&
+      ts <= now + 300_000 && now - ts < 86_400_000;
+    const threshold = finite(alert.price) && alert.price > 0;
     let trigger = false;
-    if (alert.type === 'event') trigger = now >= Date.parse(alert.date);
-    else if (alert.type === 'above') trigger = onFeed && quote.price >= alert.price;
-    else if (alert.type === 'below') trigger = onFeed && quote.price <= alert.price;
+    if (timed) trigger = now >= Date.parse(alert.date);
+    else if (alert.type === 'above') trigger = onFeed && threshold && quote.price >= alert.price;
+    else if (alert.type === 'below') trigger = onFeed && threshold && quote.price <= alert.price;
     else if (alert.type === 'invalidate') {
-      const fresh = researchQuoteStatus(quote, instrumentCurrency(alert.symbol), now).quoteStatus === 'fresh';
-      trigger = fresh && quote.price <= alert.price;
+      const fresh = researchQuoteStatus(quote, currency, now).quoteStatus === 'fresh';
+      trigger = onFeed && threshold && fresh && quote.price <= alert.price;
     }
     else if (alert.type === 'opportunity') {
       const versions = strategies[alert.key]?.versions;
       const status = analysisFor(alert.key)?.decision?.status;
       trigger = onFeed && alert.baseline !== status && status === 'opportunity' &&
-        Date.parse(versions?.[0]?.at) >= Date.parse(alert.createdAt);
+        Date.parse(versions?.[0]?.at) >= createdAt;
     }
     if (!trigger) return alert;
-    const updated = { ...alert, firedAt: new Date(now).toISOString(), observedPrice: alert.type === 'event' ? null : quote.price };
+    const updated = { ...alert, firedAt: new Date(now).toISOString(), observedPrice: quote?.price ?? null,
+      observedAt: timed ? null : new Date(ts).toISOString() };
     fired.push(updated);
     return updated;
   });

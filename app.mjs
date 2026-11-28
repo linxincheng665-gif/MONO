@@ -170,7 +170,8 @@ function scopedPortfolio(currencyCode) {
 }
 function initialTrade(forSymbol = state.watchlist[0]?.symbol ?? state.holdings[0]?.symbol ?? '') {
   const currencyCode = instrumentCurrency(forSymbol);
-  return { symbol: forSymbol, entry: '', target: '', stop: '', amount: '', riskPercent: 1, fractional: currencyCode === 'USD' };
+  return { symbol: forSymbol, entry: '', target: '', stop: '', amount: '', riskPercent: 1, costBps: '', gapPercent: '',
+    fractional: currencyCode === 'USD' };
 }
 function tradePortfolioContext(ticker, portfolio, summary = portfolioSummary(portfolio)) {
   const positionValue = summary.rows.reduce((total, row) =>
@@ -372,12 +373,14 @@ function observedPrices(ticker) {
   return mergeSeries(trendStore.observed(ticker), mark);
 }
 
+function portfolioHistoryFor(ticker) {
+  const imported = state.histories[ticker] ?? [];
+  const adjusted = trendStore.read(ticker, 'day-adjusted').bars;
+  return imported.length > 1 || !adjusted.length ? imported : adjusted;
+}
+
 function historicalPortfolio(portfolio) {
-  const histories = Object.fromEntries(portfolio.holdings.map(({ symbol: ticker }) => {
-    const imported = state.histories[ticker] ?? [];
-    const adjusted = trendStore.read(ticker, 'day-adjusted').bars;
-    return [ticker, imported.length > 1 || !adjusted.length ? imported : adjusted];
-  }));
+  const histories = Object.fromEntries(portfolio.holdings.map(({ symbol: ticker }) => [ticker, portfolioHistoryFor(ticker)]));
   return { ...portfolio, histories };
 }
 
@@ -473,7 +476,7 @@ function buildContext() {
   const simulation = riskSimulation[portfolioCurrency] ?? {};
   const riskLab = page === 'risk' && !privateAmounts && !portfolio.demo ? buildRiskLab(summary, portfolioWithHistory.histories, {
     ...state.riskProfile, shock, scenario, simulation,
-    benchmarkBars: portfolioWithHistory.histories[riskBenchmark] ?? trendStore.read(riskBenchmark, 'day-adjusted').bars,
+    benchmarkBars: portfolioWithHistory.histories[riskBenchmark] ?? portfolioHistoryFor(riskBenchmark),
   }) : null;
   const journalKey = strategyKey(symbol, researchInputs.horizon);
   const benchmarkSymbol = benchmarkFor(symbol);
@@ -858,7 +861,7 @@ function renderShell() {
     <aside class="sidebar" id="mobile-drawer" aria-label="工作空间菜单">
       <div class="drawer-head"><a class="brand" href="#overview" aria-label="MONO 首页"><span>MONO</span><i aria-hidden="true"></i><img class="workspace-monogram" src="mono-icon.svg" alt="" width="32" height="32"></a><button class="icon-button" data-action="close-menu" aria-label="关闭导航">${icons('close', 19)}</button></div>
       <nav aria-label="主导航">${nav}</nav>
-      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.3</span></div>
+      <div class="sidebar-bottom"><button class="nav-item" data-action="settings" title="数据与设置" aria-label="数据与设置">${icons('settings', 17)}<span>数据与设置</span></button><span class="version">MONO 3.3.4</span></div>
     </aside>
     <header class="topbar"><div class="topbar-content">
       <div class="topbar-brand">
@@ -1341,9 +1344,22 @@ function saveTrade() {
   state.trades.unshift({ id: newRecordId(), symbol: tradeInputs.symbol,
     entry: Number(entry), target: Number(target), stop: Number(stop), amount: amount === '' ? null : Number(amount),
     riskPercent: Number(riskPercent), fractional, shares: trade.shares, investment: trade.investment,
-    ratio: trade.ratio, risk: trade.risk, reward: trade.reward, createdAt: new Date().toISOString() });
+    ratio: trade.ratio, risk: trade.risk, reward: trade.reward, costBps: trade.costBps, gapPercent: trade.gapPercent,
+    budgetExit: trade.budgetExit, budgetRisk: trade.budgetRisk, createdAt: new Date().toISOString() });
   persist('交易计划已保存');
   renderContent();
+}
+
+function reviewSavedTrade(id) {
+  const record = state.trades.find((item) => item.id === id);
+  if (!record) return;
+  const initial = initialTrade(record.symbol);
+  tradeInputs = { ...initial, entry: record.entry, stop: record.stop, target: record.target,
+    amount: record.amount ?? '', riskPercent: record.riskPercent ?? initial.riskPercent, costBps: record.costBps ?? '',
+    gapPercent: record.gapPercent ?? '', fractional: record.fractional ?? initial.fractional };
+  renderContent();
+  root.querySelector('#trade-entry')?.focus();
+  announce('已带入原计划，仓位按当前持仓和现金重算。');
 }
 
 function useStrategy() {
@@ -1351,7 +1367,7 @@ function useStrategy() {
   if (!strategy?.symbol || !strategy.canTransfer) { announce('暂无可带入的完整计划，请核对行情及价位。'); return; }
   const inputs = state.research[strategy.symbol] ?? {};
   tradeInputs = { ...initialTrade(strategy.symbol), entry: strategy.entry, target: strategy.target, stop: strategy.stop,
-    amount: inputs.amount ?? '', riskPercent: inputs.riskPercent ?? 1 };
+    amount: inputs.amount ?? '', riskPercent: inputs.riskPercent ?? 1, costBps: inputs.costBps ?? '', gapPercent: inputs.gapPercent ?? '' };
   navigate('trades');
 }
 
@@ -1728,7 +1744,7 @@ root.addEventListener('click', (event) => {
       renderShell();
       restoreFocus(button);
     },
-    'save-trade': saveTrade, 'delete-trade': () => deleteRecord('trade', id), 'use-strategy': useStrategy,
+    'save-trade': saveTrade, 'review-trade': () => reviewSavedTrade(id), 'delete-trade': () => deleteRecord('trade', id), 'use-strategy': useStrategy,
     'research-data': configureResearch, 'research-refresh': () => { void ensureResearchEvidence(symbol, true); updateResults(); },
     'research-import': importResearchEvidence, 'research-online': resetImportedEvidence,
     'track-strategy': toggleStrategyTracking, 'add-research-alert': addResearchAlert, 'remove-research-alert': () => removeResearchAlert(id),

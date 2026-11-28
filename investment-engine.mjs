@@ -1,5 +1,5 @@
 import { instrumentCurrency, instrumentMarket, normalizeTicker, tencentSymbol } from './instruments.mjs';
-import { indicators, tradePlan } from './model.mjs';
+import { indicators, tradeExecution, tradePlan } from './model.mjs';
 
 const dayMs = 86_400_000;
 const horizonRules = [
@@ -7,11 +7,12 @@ const horizonRules = [
   { key: 'mid', label: '中线', sessions: '约 1–3 个月', window: 60, fast: 20, slow: 50, holding: 30 },
   { key: 'long', label: '长线', sessions: '约 3–12 个月', window: 120, fast: 50, slow: 120, holding: 60 },
 ];
+const eventReviewDays = 45;
 const evidenceFields = [
   ['fundamentals', 'fundamental', '基本面', 180],
   ['valuation', 'valuation', '估值', 90],
   ['macro', 'macro', '宏观环境', 90],
-  ['events', 'event', '重大事件', 45],
+  ['events', 'event', '重大事件', eventReviewDays],
   ['sentiment', 'sentiment', '市场情绪', 30],
 ];
 const typedMetrics = new Set(['revenueGrowthPct', 'operatingCashFlow', 'expenseRatioPct', 'trackingErrorPct',
@@ -130,7 +131,7 @@ function pivotRows(rows, direction) {
   });
 }
 
-function observedLevels(bars, rule) {
+function observedLevels(bars, rule, assumptions) {
   if (bars.length < rule.slow + 1) return null;
   const anchor = bars.at(-1).close;
   const window = bars.slice(-(rule.window + 1), -1);
@@ -147,9 +148,10 @@ function observedLevels(bars, rule) {
   if (!zone.length) return { support: support.price, resistance: resistance.price, bracket: null };
   const low = zone[0], high = zone[Math.min(zone.length - 1, 1)];
   const stop = support.price, target = resistance.price;
+  const execution = tradeExecution({ ...assumptions, entry: high, stop, target });
   return {
     support: stop, resistance: target,
-    bracket: { entryZone: { low, high }, entry: high, stop, target, ratio: (target - high) / (high - stop),
+    bracket: { entryZone: { low, high }, entry: high, stop, target, ratio: execution.ratio ?? null, execution,
       levels: { supportDate: support.row.date, resistanceDate: resistance.row.date,
         basis: '已完成日线的局部低点、邻近日线的开收盘价及已观察的局部高点' } },
   };
@@ -172,26 +174,52 @@ function manualCitation(inputs, group, shortKey, day, maxAge) {
   return { url, asOf, verified: Boolean(url && age >= 0 && age <= maxAge) };
 }
 
-function providerEvidence(evidence, now) {
+function filingPublication(value, now, market, today) {
+  const date = dateOnly(value);
+  if (date) return date <= today ? { day: date, time: -Infinity } : null;
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})$/i.test(value)
+    || !dateOnly(value.slice(0, 10))) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) && time <= now ? { day: marketDay(time, market).day, time } : null;
+}
+
+function providerEvidence(evidence, now, market, today) {
   const store = {};
+  let latestFiling = null;
   for (const [key] of evidenceFields) {
     store[key] = (Array.isArray(evidence?.[key]) ? evidence[key] : []).flatMap((item) => {
       if (!item || typeof item.label !== 'string') return [];
       const url = safeURL(item.url);
       const publishedAt = typeof item.publishedAt === 'string' ? item.publishedAt : null;
       const asOf = typeof item.asOf === 'string' ? item.asOf : null;
-      if (publishedAt && Date.parse(publishedAt) > now + 60_000) return [];
-      return [{
+      const kind = key === 'events' && ['filing', 'news'].includes(item.kind) ? item.kind : null;
+      // Older cached SEC rows identified registrant-wide disclosures in their generated label.
+      const registrant = kind === 'filing' && (item.scope === 'registrant'
+        || (item.source === 'SEC EDGAR' && item.label.startsWith('SEC 基金注册人申报 ')));
+      const publication = kind === 'filing' ? filingPublication(publishedAt, now, market, today) : null;
+      if (publishedAt && (kind === 'filing' ? !publication : Date.parse(publishedAt) > now + 60_000)) return [];
+      const record = {
         label: item.label.slice(0, 120), value: typeof item.value === 'string' ? item.value.slice(0, 180) : numeric(item.value),
         unit: typeof item.unit === 'string' ? item.unit.slice(0, 30) : '',
         asOf, publishedAt, source: typeof item.source === 'string' ? item.source.slice(0, 100) : '',
         url, metric: typedMetrics.has(item.metric) ? item.metric : null,
+        ...(kind ? { kind } : {}),
+        ...(registrant ? { scope: 'registrant' } : {}),
         detail: typeof item.detail === 'string' ? item.detail.slice(0, 300) : '',
-      }];
+      };
+      if (publication && !registrant && url && record.source.trim() && record.label.trim()
+        && (!latestFiling || publication.day > latestFiling.day
+          || (publication.day === latestFiling.day && publication.time > latestFiling.time))) {
+        latestFiling = { record, ...publication };
+      }
+      return [record];
     }).slice(0, 12);
   }
-  return { ...store, symbol: evidence?.symbol ?? null, fetchedAt: evidence?.fetchedAt ?? null,
-    errors: Array.isArray(evidence?.errors) ? evidence.errors.slice(0, 12) : [] };
+  return {
+    evidence: { ...store, symbol: evidence?.symbol ?? null, fetchedAt: evidence?.fetchedAt ?? null,
+      errors: Array.isArray(evidence?.errors) ? evidence.errors.slice(0, 12) : [] },
+    latestFiling,
+  };
 }
 
 function sourcedMetric(records, metric, units, day, maxAge, allowUndatedRelease = false) {
@@ -228,7 +256,7 @@ function quoteValuation(value, symbol, now) {
   return { kind: value.kind, ratios };
 }
 
-function evidenceChecks(inputs, instrumentType, bars, calendar, records, currency, marketRatios) {
+function evidenceChecks(inputs, instrumentType, bars, calendar, records, currency, marketRatios, latestFiling) {
   const growth = numeric(inputs.revenueGrowth), pe = numeric(inputs.pe), expense = numeric(inputs.expenseRatio);
   const nav = positive(inputs.nav), fair = positive(inputs.fairValue);
   const close = bars.at(-1)?.close;
@@ -286,7 +314,12 @@ function evidenceChecks(inputs, instrumentType, bars, calendar, records, currenc
     const rate = sourcedMetric(records.macro, 'rateChangeBps', ['基点', 'bps'], calendar.day, 90);
     if (rate) record('macro', 'watch', `来源记录的利率变化为 ${rate.value.toFixed(0)} 个基点。影响取决于标的利率敏感性。`, rate);
   }
-  if (['pass', 'watch', 'fail'].includes(inputs.eventsStatus)) {
+  const eventReview = manualCitation(inputs, 'events', 'event', calendar.day, eventReviewDays);
+  if (inputs.eventsStatus === 'pass' && eventReview.verified && latestFiling?.day > eventReview.asOf) {
+    const { record: disclosure, day } = latestFiling;
+    record('events', 'watch', `${day} 发布了「${disclosure.label}」，晚于 ${eventReview.asOf} 的核验。查阅原文后更新事件结论和核验截至日期。`,
+      { ...disclosure, asOf: day });
+  } else if (['pass', 'watch', 'fail'].includes(inputs.eventsStatus)) {
     record('events', inputs.eventsStatus, String(inputs.event ?? '').trim().slice(0, 180)
       || { pass: '已录入事件核验结果。', watch: '事件仍需观察。', fail: '已录入事件阻碍。' }[inputs.eventsStatus]);
   } else if (String(inputs.event ?? '').trim()) record('events', 'watch', String(inputs.event).trim().slice(0, 180));
@@ -307,7 +340,9 @@ function evidenceChecks(inputs, instrumentType, bars, calendar, records, currenc
     const citation = note?.source ? { url: note.source.url, asOf: note.source.asOf, sourceLabel: note.source.source, verified: true }
       : manualCitation(inputs, key, shortKey, calendar.day, days);
     const sources = key === 'valuation' ? [...new Map(records[key].filter((item) => item.url !== citation.url || item.asOf !== citation.asOf)
-      .map((item) => [`${item.url}|${item.asOf}`, item])).values()] : records[key];
+      .map((item) => [`${item.url}|${item.asOf}`, item])).values()]
+      : key === 'events' && note?.source ? records[key].filter((item) => item.url !== note.source.url || item.publishedAt !== note.source.publishedAt)
+      : records[key];
     const status = note?.status === 'pass' && !citation.verified ? 'watch' : (note?.status ?? 'pending');
     const detail = note ? note.detail + (note.status === 'pass' && !citation.verified ? ' 补充有效的来源链接及日期后方可通过。' : '')
       : sources.length ? '已取得出处。数据先列为研究背景，等你核验后再用于条件判断。' : '待补充研究依据。';
@@ -359,6 +394,9 @@ function statusFor(rule, observed, freshness, quote, checks, type, splitDate, vo
   const check = (key) => checks.find((item) => item.key === key);
   if (check('events').status === 'fail') {
     return result('wait', '等待事件明朗', '研究记录显示重大事件仍构成阻碍。', '核对事件结果并更新事件判断。');
+  }
+  if (bracket && !bracket.execution.valid) {
+    return result('watch', '核对成交假设', bracket.execution.error, '修改成交成本或止损下方偏离后重新计算。');
   }
   if (!bracket || bracket.ratio < 1.5) {
     const reason = bracket ? `情景盈亏比为 ${bracket.ratio.toFixed(2)} 倍，低于规则的 1.50 倍。`
@@ -416,11 +454,12 @@ function scenarioList(horizon) {
 }
 
 function estimateSize(portfolio, bracket, symbol, metadata) {
+  if (bracket.execution?.valid === false) return bracket.execution;
   const weight = numeric(portfolio.weight ?? portfolio.currentWeight);
   const equity = positive(portfolio.equity);
   const positionValue = portfolio.positionValue ?? (weight === null || equity === null ? null : equity * weight / 100);
   return { ...tradePlan({ ...portfolio, ...bracket, symbol, positionValue, riskPercent: portfolio.riskPercent ?? 1,
-    lotSize: numeric(metadata.lotSize) }), demo: portfolio.demo };
+    lotSize: numeric(metadata.lotSize), costBps: bracket.execution?.costBps, gapPercent: bracket.execution?.gapPercent }), demo: portfolio.demo };
 }
 
 function manualScenarioFor(inputs) {
@@ -430,9 +469,24 @@ function manualScenarioFor(inputs) {
   if (entry === null || stop === null || target === null || stop >= entry || entry >= target) {
     return { valid: false, reason: '完善手动价格情景，确保止损价低于入场价，入场价低于目标价。' };
   }
-  return { valid: true, entryZone: { low: entry, high: entry }, entry, stop, target,
-    ratio: (target - entry) / (entry - stop),
+  const execution = tradeExecution({ entry, stop, target, costBps: inputs.costBps, gapPercent: inputs.gapPercent });
+  if (!execution.valid) return { valid: false, reason: execution.error };
+  return { valid: true, entryZone: { low: entry, high: entry }, entry, stop, target, ratio: execution.ratio, execution,
     levels: { supportDate: null, resistanceDate: null, basis: '手动输入的假设价位。' } };
+}
+
+export function dailySampleIssue(dates) {
+  if (dates.length < 2) return null;
+  const times = dates.map((date) => Date.parse(date));
+  if (times.some((time, index) => index > 0 && time - times[index - 1] > 14 * dayMs)) return 'gap';
+  // Approximate weekday coverage without assuming an exchange-specific holiday calendar.
+  const calendarDays = (times.at(-1) - times[0]) / dayMs + 1;
+  return dates.length < calendarDays * 5 / 7 * .75 ? 'sparse' : null;
+}
+
+export function hasPriceHistoryJump(previousClose, nextPrice) {
+  const ratio = nextPrice / previousClose;
+  return ratio < .55 || ratio > 1.65;
 }
 
 function rollingAverage(bars, end, count) {
@@ -505,8 +559,13 @@ export function walkForwardTradeRule(bars, rule = horizonRules[1], { demo = fals
   if (!checkedBars.every(({ open, high, low, close }) => [open, high, low, close].every((price) => Number.isFinite(price) && price > 0))) {
     return unavailable('历史检验需要完整、连续记录的真实日线 OHLC。');
   }
-  if (checkedBars.some((bar, index) => index && Date.parse(bar.date) - Date.parse(checkedBars[index - 1].date) > 14 * dayMs)) {
+  const trainingIssue = dailySampleIssue(bars.slice(0, boundary).map(({ date }) => date));
+  const holdoutIssue = trainingOnly ? null : dailySampleIssue(bars.slice(Math.max(0, boundary - 1)).map(({ date }) => date));
+  if (trainingIssue === 'gap' || holdoutIssue === 'gap') {
     return unavailable('历史序列的交易日间隔过长，当前无法确认下一交易日是否完整记录。');
+  }
+  if (trainingIssue === 'sparse' || holdoutIssue === 'sparse') {
+    return unavailable('前段或留出区的记录频率过低，规则检验需要较连续的日线。请核对是否导入了周线或缺少交易日。');
   }
   if (boundary < Math.max(rule.slow, breakout) + rule.holding + 10 || (!trainingOnly && sample.holdout < rule.holding + 10)) {
     return unavailable('留出区或校准区的完整交易日不足。');
@@ -534,26 +593,28 @@ export function runInvestmentResearch({
   const calendar = marketDay(time, market);
   const daily = completedBars(bars, calendar);
   const benchmark = completedBars(benchmarkBars, calendar);
-  const evidence = providerEvidence(suppliedEvidence?.symbol && normalizeTicker(suppliedEvidence.symbol) !== normalized ? null : suppliedEvidence, time);
+  const acceptedEvidence = suppliedEvidence?.symbol && normalizeTicker(suppliedEvidence.symbol) !== normalized ? null : suppliedEvidence;
+  const { evidence, latestFiling } = providerEvidence(acceptedEvidence, time, market, calendar.day);
   const marketRatios = instrumentType === 'equity' ? quoteFacts?.ratios ?? [] : [];
   evidence.valuation.unshift(...marketRatios);
-  const checks = evidenceChecks(inputs, instrumentType, daily, calendar, evidence, currency, marketRatios);
+  const checks = evidenceChecks(inputs, instrumentType, daily, calendar, evidence, currency, marketRatios, latestFiling);
   const technical = technicalState(daily, benchmark);
   const data = dataState(daily, quote, calendar, time, historySource, demo, currency);
   const splitDates = discontinuities(daily);
+  const assumptions = { costBps: inputs.costBps, gapPercent: inputs.gapPercent };
   const held = !demo && !portfolio.demo && (positive(portfolio.positionValue) !== null
     || positive(portfolio.weight ?? portfolio.currentWeight) !== null);
   const horizons = horizonRules.map((rule) => {
     const trend = trendFor(daily, rule);
     const enoughData = data.historyStatus === 'ready' && data.quoteStatus !== 'demo' && daily.length >= rule.slow + 1;
     const splitDate = enoughData && splitDates.at(-1) >= daily.at(-(rule.slow + 1)).date ? splitDates.at(-1) : null;
-    const observed = enoughData && !splitDate ? observedLevels(daily, rule) : null;
+    const observed = enoughData && !splitDate ? observedLevels(daily, rule, assumptions) : null;
     const bracket = observed?.bracket;
     const decision = statusFor(rule, observed, data, quote, checks, instrumentType, splitDate, technical.volumeRatio, held, trend);
     const stop = bracket?.stop ?? (held ? observed?.support : null) ?? null;
     return { key: rule.key, label: rule.label, sessions: rule.sessions, ...decision, trend,
       entryZone: bracket?.entryZone ?? null, entry: bracket?.entry ?? null, target: bracket?.target ?? null,
-      stop, ratio: bracket?.ratio ?? null, levels: bracket?.levels ?? null,
+      stop, ratio: bracket?.ratio ?? null, levels: bracket?.levels ?? null, execution: bracket?.execution ?? null,
       support: observed?.support ?? null, resistance: observed?.resistance ?? null,
       trigger: decision.next,
       invalidation: stop === null ? '尚无可核对的失效价。'
@@ -584,7 +645,7 @@ export function runInvestmentResearch({
   const sized = display.entry !== null && !demo && (manualScenario?.valid || selected.status !== 'invalidated')
     ? estimateSize(portfolio, display, normalized, metadata) : null;
   const plan = display.entry !== null ? { entryZone: display.entryZone, entry: display.entry, stop: display.stop,
-    target: display.target, ratio: display.ratio, size: sized, levels: display.levels,
+    target: display.target, ratio: display.ratio, size: sized, levels: display.levels, execution: display.execution,
     source: manualScenario?.valid ? 'manual' : 'observed' } : null;
   const uncertainty = [
     '价格情景为已观察价位的条件演算。跳空可能穿越失效价，成交价和实际损失可能不同。',

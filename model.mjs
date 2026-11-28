@@ -354,23 +354,46 @@ function roundShares(limit, precision) {
   return Math.floor(units + Math.min(1e-7, Number.EPSILON * Math.abs(units) * 2)) / precision;
 }
 
-export function tradePlan({
-  symbol, entry, target, stop, amount, riskPercent, cash, equity, fractional, incomplete,
-  positionValue, capPercent, reservePercent, lotSize,
-}) {
+export function tradeExecution({ entry, target, stop, costBps, gapPercent }) {
   const entryPrice = positive(entry);
   const targetPrice = positive(target);
   const stopPrice = positive(stop);
+  if ([entryPrice, targetPrice, stopPrice].includes(null)) return { valid: false, error: "请填写入场、止损与目标价。" };
+  if (stopPrice >= entryPrice || targetPrice <= entryPrice) return { valid: false, error: "做多计划须满足止损价 < 入场价 < 目标价。" };
+  const assumedNumber = (value) => value == null || (typeof value === "string" && !value.trim()) ? 0 : nonnegative(value);
+  const cost = assumedNumber(costBps);
+  const gap = assumedNumber(gapPercent);
+  if (cost === null || cost > 1000 || gap === null || gap > 100) {
+    return { valid: false, error: "单边成本须为 0–1000 个基点，止损下方偏离须为 0%–100%。" };
+  }
+  const friction = cost / 10_000;
+  const unitSpend = entryPrice * (1 + friction);
+  const budgetExit = stopPrice * (1 - gap / 100);
+  const riskPerShare = unitSpend - stopPrice * (1 - friction);
+  const budgetRiskPerShare = unitSpend - budgetExit * (1 - friction);
+  const rewardPerShare = targetPrice * (1 - friction) - unitSpend;
+  const ratio = rewardPerShare / budgetRiskPerShare;
+  if (![unitSpend, riskPerShare, budgetRiskPerShare, rewardPerShare, ratio].every(Number.isFinite) || budgetRiskPerShare <= 0) {
+    return { valid: false, error: "输入超出可计算范围。" };
+  }
+  return { valid: true, entryPrice, costBps: cost, gapPercent: gap, friction, unitSpend,
+    budgetExit, budgetRiskPerShare, riskPerShare, rewardPerShare, ratio };
+}
+
+export function tradePlan({
+  symbol, entry, target, stop, amount, riskPercent, cash, equity, fractional, incomplete,
+  positionValue, capPercent, reservePercent, lotSize, costBps, gapPercent,
+}) {
+  const execution = tradeExecution({ entry, target, stop, costBps, gapPercent });
+  if (!execution.valid) return execution;
+  const { entryPrice, unitSpend, friction, riskPerShare, budgetRiskPerShare, rewardPerShare, ratio } = execution;
   const amountEntered = amount != null && String(amount).trim() !== "";
   const requestedAmount = nonnegative(amount);
   const requestedRisk = nonnegative(riskPercent);
   const availableCash = nonnegative(cash);
   const portfolioEquity = positive(equity);
-  if ([entryPrice, targetPrice, stopPrice, requestedRisk].includes(null) || (amountEntered && requestedAmount === null)) {
-    return { valid: false, error: "请填写有效的价位与单笔风险预算。投入上限可留空。" };
-  }
-  if (stopPrice >= entryPrice || targetPrice <= entryPrice) {
-    return { valid: false, error: "做多计划须满足止损价 < 入场价 < 目标价。" };
+  if (requestedRisk === null || (amountEntered && requestedAmount === null)) {
+    return { valid: false, error: "请填写有效的单笔风险预算。投入上限可留空。" };
   }
   if (requestedRisk > 100) return { valid: false, error: "风险预算必须在 0% 与 100% 之间。" };
   if (incomplete || availableCash === null || portfolioEquity === null) {
@@ -384,23 +407,22 @@ export function tradePlan({
     return { valid: false, error: "核对当前持仓、单标的上限与现金储备比例。" };
   }
 
-  const riskPerShare = entryPrice - stopPrice;
-  const rewardPerShare = targetPrice - entryPrice;
   const budget = portfolioEquity * (requestedRisk / 100);
   const cashReserved = portfolioEquity * ((reserve ?? 0) / 100);
   const cashAfterReserve = Math.max(0, availableCash - cashReserved);
   const allocationCapacity = cap === null ? null : Math.max(0, portfolioEquity * (cap / 100) - heldValue);
-  const cashLimit = Math.min(requestedAmount ?? Infinity, cashAfterReserve) / entryPrice;
-  const riskLimit = budget / riskPerShare;
+  const cashLimit = Math.min(requestedAmount ?? Infinity, cashAfterReserve) / unitSpend;
+  const riskLimit = budget / budgetRiskPerShare;
+  // Entry costs reduce cash and equity, while the position increases by the trade notional.
+  const capLimit = allocationCapacity === null ? Infinity : allocationCapacity / (entryPrice * (1 + cap / 100 * friction));
   const limits = [
-    ["cap", allocationCapacity === null ? Infinity : allocationCapacity / entryPrice],
-    [cashReserved > 0 ? "reserve" : "cash", cashAfterReserve / entryPrice],
-    ["amount", requestedAmount === null ? Infinity : requestedAmount / entryPrice],
+    ["cap", capLimit],
+    [cashReserved > 0 ? "reserve" : "cash", cashAfterReserve / unitSpend],
+    ["amount", requestedAmount === null ? Infinity : requestedAmount / unitSpend],
     ["risk", riskLimit],
   ];
   const shareLimit = Math.min(...limits.map(([, limit]) => limit));
-  const ratio = rewardPerShare / riskPerShare;
-  if (!Number.isFinite(shareLimit) || !Number.isFinite(ratio)) {
+  if (!Number.isFinite(shareLimit)) {
     return { valid: false, error: "输入超出可计算范围。" };
   }
   const quantity = Number.isInteger(lotSize) && lotSize > 0 ? { minimum: lotSize, increment: lotSize }
@@ -408,10 +430,14 @@ export function tradePlan({
   const rounded = quantity.increment < 1 ? roundShares(shareLimit, 1 / quantity.increment)
     : roundShares(shareLimit / quantity.increment, 1) * quantity.increment;
   const shares = rounded >= quantity.minimum ? rounded : 0;
-  const investment = shares * entryPrice;
+  const investment = shares * unitSpend;
+  const notional = shares * entryPrice;
+  const entryCost = Math.max(0, investment - notional);
+  const postEquity = portfolioEquity - entryCost;
   const risk = shares * riskPerShare;
+  const budgetRisk = shares * budgetRiskPerShare;
   const reward = shares * rewardPerShare;
-  if (![investment, risk, reward].every(Number.isFinite)) {
+  if (![investment, risk, budgetRisk, reward].every(Number.isFinite)) {
     return { valid: false, error: "输入超出可计算范围。" };
   }
   return {
@@ -419,7 +445,12 @@ export function tradePlan({
     error: null,
     shares,
     investment,
+    entryCost,
     risk,
+    budgetRisk,
+    budgetExit: execution.budgetExit,
+    gapPercent: execution.gapPercent,
+    costBps: execution.costBps,
     reward,
     ratio,
     budget,
@@ -433,8 +464,8 @@ export function tradePlan({
     cashAfterReserve,
     allocationCapacity,
     remainingCash: Math.max(0, availableCash - investment),
-    postWeight: heldValue === null ? null : (heldValue + investment) / portfolioEquity * 100,
-    riskUsedPercent: risk / portfolioEquity * 100,
+    postWeight: heldValue === null || postEquity <= 0 ? null : (heldValue + notional) / postEquity * 100,
+    riskUsedPercent: budgetRisk / portfolioEquity * 100,
   };
 }
 

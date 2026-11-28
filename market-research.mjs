@@ -154,6 +154,7 @@ export function opportunityFor(instrument, strategy) {
   const observed = plan?.source === 'observed' ? plan : null;
   return { ...base, category: categories[0] ?? '等待条件', categories, entry: observed?.entry ?? null,
     stop: observed?.stop ?? null, target: observed?.target ?? null, zone, ratio: observed?.ratio ?? null,
+    costBps: observed?.execution?.costBps, gapPercent: observed?.execution?.gapPercent,
     historyReady: true, trend, return20: technical.return20, volatility: technical.volatility,
     volumeRatio: technical.volumeRatio, risk: strategy.uncertainty?.[0], trigger: period?.trigger };
 }

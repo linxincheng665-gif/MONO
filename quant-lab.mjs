@@ -1,5 +1,5 @@
 import { instrumentCurrency, normalizeTicker } from './instruments.mjs';
-import { runInvestmentResearch, walkForwardTradeRule } from './investment-engine.mjs';
+import { dailySampleIssue, hasPriceHistoryJump, runInvestmentResearch, walkForwardTradeRule } from './investment-engine.mjs';
 
 const ONE_DAY = 86_400_000;
 const WINDOWS = [20, 60, 252];
@@ -55,8 +55,7 @@ function snapshot(rows, lastBarDate) {
   for (let index = 1; index < bars.length; index += 1) {
     const left = bars[index - 1], right = bars[index];
     longestCalendarGapDays = Math.max(longestCalendarGapDays, (Date.parse(right.date) - Date.parse(left.date)) / ONE_DAY);
-    const overnight = (right.open ?? right.close) / left.close;
-    if (overnight < .55 || overnight > 1.65) discontinuityDates.push(right.date);
+    if (hasPriceHistoryJump(left.close, right.open ?? right.close)) discontinuityDates.push(right.date);
   }
   return {
     bars, discontinuityDates,
@@ -103,9 +102,10 @@ function riskWindow(data, sessions, available) {
   if (data.discontinuityDates.some((day) => day > rows[0].date)) {
     return { ...base, status: 'unavailable', reason: '窗口内存在异常价格跳变，需核对原始价格与复权口径。' };
   }
-  const gap = rows.some((row, index) => index && Date.parse(row.date) - Date.parse(rows[index - 1].date) > 14 * ONE_DAY);
-  return { ...base, status: gap ? 'limited' : 'ready', ...priceMetrics(rows, !gap),
-    reason: gap ? '日期间隔超过 14 天，展示区间收益及观测回撤，省略年化波动。' : '' };
+  const issue = dailySampleIssue(rows.map(({ date }) => date));
+  const reason = { gap: '区间中有超过 14 天的记录间隔。', sparse: '记录频率偏低，可能包含周线或缺失交易日。' }[issue];
+  return { ...base, label: issue ? `${sessions} 段观测` : base.label, status: issue ? 'limited' : 'ready', ...priceMetrics(rows, !issue),
+    reason: reason ? `${reason} 区间收益和回撤按已观测价格计算。` : '' };
 }
 
 function benchmarkComparison(data, benchmark, symbol, benchmarkSymbol, available) {
@@ -126,7 +126,7 @@ function benchmarkComparison(data, benchmark, symbol, benchmarkSymbol, available
   const leftCount = data.bars.filter(inScope).length, rightCount = benchmark.bars.filter(inScope).length;
   const stale = Date.parse(data.bars.at(-1).date) - Date.parse(last) > 7 * ONE_DAY;
   const annualizable = left.length / Math.max(leftCount, rightCount) >= .9 && !stale
-    && !left.some((bar, i) => i > 0 && Date.parse(bar.date) - Date.parse(left[i - 1].date) > 14 * ONE_DAY);
+    && !dailySampleIssue(left.map(({ date }) => date));
   const asset = priceMetrics(left, annualizable), reference = priceMetrics(left.map((bar) => right.get(bar.date)), annualizable);
   return { ...blank, status: annualizable ? 'ready' : 'limited', pairs: left.length, asset, reference,
     firstDate: first, lastDate: last, returnGap: asset.totalReturn - reference.totalReturn,
@@ -232,7 +232,8 @@ function evidenceText(symbol, data, analysis, comparison, validation, risk) {
     `日线来源：${analysis.data?.historySource || '待确认'}。完整样本 ${data.coverage.completedRows} 根，OHLC ${data.coverage.ohlcRows} 根，最近完整日期 ${data.coverage.lastDate ?? '—'}。`,
   ];
   if (risk.status === 'ready' || risk.status === 'limited') {
-    lines.push(`最近 ${risk.sessions} 个观测收益 ${formatPercent(risk.totalReturn)}，收盘回撤 ${formatPercent(risk.maxDrawdown)}，年化实现波动 ${formatPercent(risk.volatility)}。`);
+    const volatility = Number.isFinite(risk.volatility) ? `，年化实现波动 ${formatPercent(risk.volatility)}` : '';
+    lines.push(`${risk.firstDate} 至 ${risk.lastDate} 观察到 ${risk.sessions} 段收益变化，区间收益 ${formatPercent(risk.totalReturn)}，收盘回撤 ${formatPercent(risk.maxDrawdown)}${volatility}。${risk.reason}`);
   }
   if (comparison.asset) {
     lines.push(`基准 ${comparison.benchmark}，${comparison.firstDate} 至 ${comparison.lastDate} 配对 ${comparison.pairs} 日，标的与基准收益差 ${comparison.returnGap.toFixed(2)} 个百分点。`);
@@ -290,11 +291,14 @@ export function runQuantLab({
   const shortRisk = riskWindows[0], mediumRisk = riskWindows[1];
   const quiet = shortRisk.volatility != null && mediumRisk.volatility > 0;
   const regime = quiet ? shortRisk.volatility / mediumRisk.volatility : null;
+  const trendIssue = dailySampleIssue(normalized.bars.slice(-50).map(({ date }) => date));
   const findings = [
-    { key: 'trend', label: '趋势结构', status: usable && Number.isFinite(analysis.technical?.ma50) ? 'observed' : 'pending',
-      detail: usable ? `MA20 ${analysis.technical?.ma20?.toFixed(2) ?? '—'}，MA50 ${analysis.technical?.ma50?.toFixed(2) ?? '—'}，RSI(14) ${analysis.technical?.rsi14?.toFixed(1) ?? '—'}。` : '等待可核验日线。' },
-    { key: 'volume', label: '成交量', status: usable && Number.isFinite(analysis.technical?.volumeRatio) ? 'observed' : 'pending',
-      detail: usable && Number.isFinite(analysis.technical?.volumeRatio) ? `最新完整日成交量为前 20 日均量的 ${analysis.technical.volumeRatio.toFixed(2)} 倍。` : '需要完整的最新成交量和前 20 日样本。' },
+    { key: 'trend', label: '趋势结构', status: usable && !trendIssue && Number.isFinite(analysis.technical?.ma50) ? 'observed' : 'pending',
+      detail: !usable ? '等待可核验日线。' : trendIssue ? '观察日期较疏，均线判断需更连续的日线。'
+        : `MA20 ${analysis.technical?.ma20?.toFixed(2) ?? '—'}，MA50 ${analysis.technical?.ma50?.toFixed(2) ?? '—'}，RSI(14) ${analysis.technical?.rsi14?.toFixed(1) ?? '—'}。` },
+    { key: 'volume', label: '成交量', status: usable && shortRisk.status !== 'limited' && Number.isFinite(analysis.technical?.volumeRatio) ? 'observed' : 'pending',
+      detail: shortRisk.status === 'limited' ? shortRisk.reason : usable && Number.isFinite(analysis.technical?.volumeRatio)
+        ? `最新完整日成交量为前 20 日均量的 ${analysis.technical.volumeRatio.toFixed(2)} 倍。` : '需要完整的最新成交量和前 20 日样本。' },
     { key: 'volatility', label: '波动结构', status: regime === null ? 'pending' : 'observed',
       detail: regime === null ? '需同时具备 20 日和 60 日可靠波动样本。'
         : `20 日波动为 60 日的 ${regime.toFixed(2)} 倍。${regime >= 1.3 ? '短期波动高于较长窗口。' : regime <= .7 ? '短期波动低于较长窗口。' : '两个窗口的波动接近。'}` },
